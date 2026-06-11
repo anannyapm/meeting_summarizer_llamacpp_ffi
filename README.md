@@ -68,7 +68,7 @@ Most pub.dev “llama” packages hide these layers. This repo shows how to own 
 - **Worker isolate** — `NativeBridgeWorkerClient` runs FFI on a background isolate so the UI stays responsive
 - **Token streaming** — C++ callbacks push tokens to Dart as they are generated
 - **Model download & caching** — `ModelManager` downloads GGUF files to app documents (no 600MB+ asset bundle required)
-- **Multiple model presets** — Llama 3.2 1B, TinyLlama, Qwen2.5, SmolLM2 (see `lib/models/model_presets.dart`)
+- **Multiple model presets** — SmolLM2 360M, Qwen2.5 0.5B, Llama 3.2 1B, TinyLlama, and larger tiers (see `lib/models/model_presets.dart`)
 - **Summary history** — persisted locally with `shared_preferences`
 - **Developer mode** — FFI echo/stream tests and bridge diagnostics behind a settings toggle
 
@@ -285,7 +285,7 @@ flutter run --release
 flutter run --dart-define=MODEL_PRESET=tinyllama_1_1b_q4_k_m
 ```
 
-Valid IDs are defined in `lib/models/model_presets.dart` (`llama3_2_1b_q4_k_m`, `tinyllama_1_1b_q4_k_m`, `qwen2_5_1_5b_q4_k_m`, `smollm2_1_7b_q4_k_m`).
+Valid IDs are defined in `lib/models/model_presets.dart` (`smollm2_360m_q4_k_m`, `qwen2_5_0_5b_q4_k_m`, `llama3_2_1b_q4_k_m`, `tinyllama_1_1b_q4_k_m`, `qwen2_5_1_5b_q4_k_m`, `smollm2_1_7b_q4_k_m`).
 
 ### Watch logs
 
@@ -301,12 +301,16 @@ Tagged logging uses `lib/core/app_logger.dart`.
 
 ## Model management
 
-| Preset ID                      | Model                 | Approx. size (Q4_K_M) |
-| ------------------------------ | --------------------- | --------------------- |
-| `llama3_2_1b_q4_k_m` (default) | Llama 3.2 1B Instruct | ~800MB                |
-| `tinyllama_1_1b_q4_k_m`        | TinyLlama 1.1B Chat   | ~600MB                |
-| `qwen2_5_1_5b_q4_k_m`          | Qwen2.5 1.5B Instruct | ~1GB                  |
-| `smollm2_1_7b_q4_k_m`          | SmolLM2 1.7B Instruct | ~1GB                  |
+| Preset ID                      | Model                 | Tier                   | Approx. size (Q4_K_M) |
+| ------------------------------ | --------------------- | ---------------------- | --------------------- |
+| `smollm2_360m_q4_k_m`          | SmolLM2 360M Instruct | Fast                   | ~271MB                |
+| `qwen2_5_0_5b_q4_k_m`          | Qwen2.5 0.5B Instruct | Fast                   | ~398MB                |
+| `tinyllama_1_1b_q4_k_m`        | TinyLlama 1.1B Chat   | Fast                   | ~600MB                |
+| `llama3_2_1b_q4_k_m` (default) | Llama 3.2 1B Instruct | Balanced (recommended) | ~800MB                |
+| `qwen2_5_1_5b_q4_k_m`          | Qwen2.5 1.5B Instruct | Slow on CPU            | ~1GB                  |
+| `smollm2_1_7b_q4_k_m`          | SmolLM2 1.7B Instruct | Slow on CPU            | ~1GB                  |
+
+Each preset carries a mobile inference profile (`mobileNCtx`, `mobileMaxOutputTokens`, `promptMode`) applied automatically when the model loads. Fast and balanced tiers use native chat templates and up to 32 output tokens; slow tiers cap at 16 tokens.
 
 `ModelManager`:
 
@@ -324,13 +328,14 @@ After download, `SummarizationProvider.loadModel()` loads weights through the na
 
 ### Summarization defaults
 
-In `lib/services/summarization_service.dart`:
+Per-preset profiles in `lib/models/model_presets.dart` (applied in `SummarizationService`):
 
-| Parameter         | Default | Effect                                                     |
-| ----------------- | ------- | ---------------------------------------------------------- |
-| `nCtx`            | `2048`  | Context window; long transcripts are chunked automatically |
-| `maxOutputTokens` | `512`   | Generation cap (stops earlier on EOG)                      |
-| `nGpuLayers`      | `999`   | Offload layers to GPU when available (device-dependent)    |
+| Parameter               | Fast / balanced tiers | Slow tiers                                              | Effect                                                     |
+| ----------------------- | --------------------- | ------------------------------------------------------- | ---------------------------------------------------------- |
+| `mobileNCtx`            | `256`                 | `256`                                                   | Context window; long transcripts are chunked automatically |
+| `mobileMaxOutputTokens` | `32`                  | `16`                                                    | Generation cap (stops earlier on EOG)                      |
+| `promptMode`            | `nativeChatTemplate`  | `nativeChatTemplate`                                    | Uses `llama_chat_apply_template()` per model               |
+| `nGpuLayers`            | `999`                 | Offload layers to GPU when available (device-dependent) |
 
 ### Chat templates (per preset)
 

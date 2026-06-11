@@ -7,12 +7,20 @@ import 'package:ffi_learn/services/summarization_service.dart';
 
 enum SummarizationStatus { idle, generating, done, error }
 
-// Base timeout; extended automatically for large on-device models.
+enum SummarizationPhase {
+  idle,
+  loadingModel,
+  prefilling,
+  streaming,
+  done,
+  error,
+}
+
 const Duration kFirstTokenTimeoutBase = Duration(seconds: 120);
 const Duration kFirstTokenTimeoutMax = Duration(seconds: 420);
 const Duration kTotalGenerationTimeout = Duration(seconds: 420);
+const Duration kPostAbortGracePeriod = Duration(seconds: 5);
 
-/// Rough prefill budget: ~2.5 s per estimated prompt token on 1B-class CPU.
 Duration firstTokenTimeoutForTranscript(int transcriptChars) {
   final estimatedPromptTokens = (transcriptChars / 2.5).round() + 20;
   final seconds = (estimatedPromptTokens * 2.5).clamp(
@@ -28,6 +36,7 @@ class SummarizationProvider extends ChangeNotifier {
   final SummarizationService _summarizationService;
 
   SummarizationStatus _status = SummarizationStatus.idle;
+  SummarizationPhase _phase = SummarizationPhase.idle;
   String _summary = '';
   String? _errorMessage;
   bool _isLoadingModel = false;
@@ -37,9 +46,16 @@ class SummarizationProvider extends ChangeNotifier {
   StreamSubscription<String>? _streamSubscription;
   Timer? _generationDeadlineTimer;
   Timer? _firstTokenDeadlineTimer;
+  bool _firstTokenGraceActive = false;
 
   SummarizationStatus get status => _status;
-  bool get isGenerating => _status == SummarizationStatus.generating;
+  SummarizationPhase get phase => _phase;
+  bool get isGenerating =>
+      _phase == SummarizationPhase.loadingModel ||
+      _phase == SummarizationPhase.prefilling ||
+      _phase == SummarizationPhase.streaming;
+  bool get isPrefilling => _phase == SummarizationPhase.prefilling;
+  bool get isStreaming => _phase == SummarizationPhase.streaming;
   String get summary => _summary;
   String? get errorMessage => _errorMessage;
   bool get hasSummary => _summary.trim().isNotEmpty;
@@ -49,7 +65,22 @@ class SummarizationProvider extends ChangeNotifier {
   bool get wasTranscriptTruncated => _wasTranscriptTruncated;
   bool get isSlowModelForMobile =>
       !_summarizationService.isMobileRecommendedModel;
+  int get maxTranscriptChars =>
+      _summarizationService.effectiveMaxTranscriptChars;
   String? get currentModelPath => _summarizationService.modelPath;
+
+  void _setPhase(SummarizationPhase phase) {
+    _phase = phase;
+    _status = switch (phase) {
+      SummarizationPhase.idle => SummarizationStatus.idle,
+      SummarizationPhase.loadingModel ||
+      SummarizationPhase.prefilling ||
+      SummarizationPhase.streaming =>
+        SummarizationStatus.generating,
+      SummarizationPhase.done => SummarizationStatus.done,
+      SummarizationPhase.error => SummarizationStatus.error,
+    };
+  }
 
   Future<bool> loadModel() async {
     AppLogger.log('MODEL', 'Provider.loadModel invoked');
@@ -103,7 +134,7 @@ class SummarizationProvider extends ChangeNotifier {
       _isModelLoaded = false;
       _modelInfo = 'Not loaded';
       _summary = '';
-      _status = SummarizationStatus.idle;
+      _setPhase(SummarizationPhase.idle);
     } catch (error) {
       _errorMessage = error.toString();
       AppLogger.log('MODEL', 'Provider.updateModelPath failed: $error');
@@ -121,20 +152,25 @@ class SummarizationProvider extends ChangeNotifier {
     await _streamSubscription?.cancel();
     _generationDeadlineTimer?.cancel();
     _firstTokenDeadlineTimer?.cancel();
+    _firstTokenGraceActive = false;
     _summary = '';
     _errorMessage = null;
     _wasTranscriptTruncated = false;
-    _status = SummarizationStatus.generating;
+    _setPhase(SummarizationPhase.prefilling);
     notifyListeners();
 
     try {
       if (!_isModelLoaded) {
+        _setPhase(SummarizationPhase.loadingModel);
+        notifyListeners();
         await loadModel();
         if (!_isModelLoaded) {
-          _status = SummarizationStatus.error;
+          _setPhase(SummarizationPhase.error);
           notifyListeners();
           return;
         }
+        _setPhase(SummarizationPhase.prefilling);
+        notifyListeners();
       }
       _summarizationService.prepareInput(transcript);
       _wasTranscriptTruncated = _summarizationService.lastInputWasTruncated;
@@ -155,6 +191,8 @@ class SummarizationProvider extends ChangeNotifier {
           if (!firstTokenLogged) {
             firstTokenLogged = true;
             _firstTokenDeadlineTimer?.cancel();
+            _firstTokenGraceActive = false;
+            _setPhase(SummarizationPhase.streaming);
             AppLogger.log(
               'SUMMARIZE',
               'First token in ${streamWatch.elapsedMilliseconds} ms',
@@ -166,12 +204,20 @@ class SummarizationProvider extends ChangeNotifier {
               'Streaming progress tokenCount=$tokenCount summaryChars=${_summary.length}',
             );
           }
-          debugPrint('[SUMMARIZE] TOKEN RECEIVED="$token"');
           _summary += token;
           notifyListeners();
         },
         onError: (Object error) {
-          _status = SummarizationStatus.error;
+          if (_firstTokenGraceActive && _summary.trim().isNotEmpty) {
+            _setPhase(SummarizationPhase.done);
+            AppLogger.log(
+              'SUMMARIZE',
+              'Stream error after partial output — accepting summary: $error',
+            );
+            notifyListeners();
+            return;
+          }
+          _setPhase(SummarizationPhase.error);
           _errorMessage = error.toString();
           AppLogger.log('SUMMARIZE', 'Stream error: $error');
           notifyListeners();
@@ -179,9 +225,10 @@ class SummarizationProvider extends ChangeNotifier {
         onDone: () {
           _generationDeadlineTimer?.cancel();
           _firstTokenDeadlineTimer?.cancel();
+          _firstTokenGraceActive = false;
           _streamSubscription = null;
-          if (_status != SummarizationStatus.error) {
-            _status = SummarizationStatus.done;
+          if (_phase != SummarizationPhase.error) {
+            _setPhase(SummarizationPhase.done);
             AppLogger.log(
               'SUMMARIZE',
               'Stream done tokens=$tokenCount totalMs=${streamWatch.elapsedMilliseconds} summaryChars=${_summary.length}',
@@ -193,49 +240,38 @@ class SummarizationProvider extends ChangeNotifier {
       );
 
       _firstTokenDeadlineTimer = Timer(firstTokenTimeout, () {
-        if (firstTokenLogged || _status != SummarizationStatus.generating) {
+        if (firstTokenLogged || _phase != SummarizationPhase.prefilling) {
           return;
         }
-        AppLogger.log(
-          'SUMMARIZE',
-          'First-token deadline reached (${firstTokenTimeout.inSeconds}s), aborting...',
-        );
-        _status = SummarizationStatus.error;
-        _errorMessage = isSlowModelForMobile
-            ? 'No output in ${firstTokenTimeout.inSeconds} s. '
-                'Switch to Llama 3.2 1B or TinyLlama in Settings for faster CPU summarization.'
-            : 'No output in ${firstTokenTimeout.inSeconds} s — model too slow or stuck. '
-                'Try a shorter transcript.';
-        notifyListeners();
-        unawaited(_resetGeneration('first-token timeout'));
+        unawaited(_handleFirstTokenGrace(firstTokenTimeout));
       });
 
       _generationDeadlineTimer = Timer(kTotalGenerationTimeout, () async {
         _firstTokenDeadlineTimer?.cancel();
-        if (_status == SummarizationStatus.generating) {
+        if (isGenerating) {
           AppLogger.log(
             'SUMMARIZE',
             'Total deadline reached (${kTotalGenerationTimeout.inSeconds}s), aborting...',
           );
           await _resetGeneration('total timeout');
           if (_summary.trim().isNotEmpty) {
-            _status = SummarizationStatus.done;
+            _setPhase(SummarizationPhase.done);
             _errorMessage =
                 'Generation stopped after ${kTotalGenerationTimeout.inSeconds} s. Showing partial summary.';
           } else {
-            _status = SummarizationStatus.error;
+            _setPhase(SummarizationPhase.error);
             _errorMessage =
                 'Summarization exceeded ${kTotalGenerationTimeout.inSeconds} s without output. Try a shorter transcript.';
           }
           AppLogger.log(
             'SUMMARIZE',
-            'Provider deadline reached status=$_status summaryChars=${_summary.length}',
+            'Provider deadline reached phase=$_phase summaryChars=${_summary.length}',
           );
           notifyListeners();
         }
       });
     } catch (error) {
-      _status = SummarizationStatus.error;
+      _setPhase(SummarizationPhase.error);
       _errorMessage = error.toString();
       AppLogger.log(
         'SUMMARIZE',
@@ -245,12 +281,67 @@ class SummarizationProvider extends ChangeNotifier {
     }
   }
 
+  Future<void> _handleFirstTokenGrace(Duration firstTokenTimeout) async {
+    if (_phase != SummarizationPhase.prefilling) {
+      return;
+    }
+    _firstTokenGraceActive = true;
+    AppLogger.log(
+      'SUMMARIZE',
+      'First-token deadline (${firstTokenTimeout.inSeconds}s) — '
+      'waiting ${kPostAbortGracePeriod.inSeconds}s for late tokens',
+    );
+    await Future<void>.delayed(kPostAbortGracePeriod);
+
+    if (_phase != SummarizationPhase.prefilling) {
+      _firstTokenGraceActive = false;
+      return;
+    }
+    if (_summary.trim().isNotEmpty) {
+      _firstTokenGraceActive = false;
+      _setPhase(SummarizationPhase.streaming);
+      AppLogger.log('SUMMARIZE', 'Late first token accepted during grace period');
+      notifyListeners();
+      return;
+    }
+
+    AppLogger.log('SUMMARIZE', 'Grace expired — aborting stream');
+    try {
+      await _summarizationService.abortStream();
+    } catch (_) {}
+
+    await Future<void>.delayed(kPostAbortGracePeriod);
+    _firstTokenGraceActive = false;
+
+    if (_summary.trim().isNotEmpty) {
+      _setPhase(
+        _streamSubscription != null
+            ? SummarizationPhase.streaming
+            : SummarizationPhase.done,
+      );
+      AppLogger.log('SUMMARIZE', 'Partial summary accepted after abort grace');
+      notifyListeners();
+      return;
+    }
+
+    if (_phase != SummarizationPhase.prefilling) {
+      return;
+    }
+
+    _setPhase(SummarizationPhase.error);
+    _errorMessage = isSlowModelForMobile
+        ? 'No output in ${firstTokenTimeout.inSeconds} s. '
+            'Switch to Llama 3.2 1B or SmolLM2 360M in Settings for faster CPU summarization.'
+        : 'No output in ${firstTokenTimeout.inSeconds} s — model too slow or stuck. '
+            'Try a shorter transcript.';
+    notifyListeners();
+    await _resetGeneration('first-token timeout');
+  }
+
   Future<void> _resetGeneration(String reason) async {
     AppLogger.log('SUMMARIZE', 'Resetting generation ($reason)');
     await _streamSubscription?.cancel();
     _streamSubscription = null;
-    // Native decode blocks the worker isolate; abort/unload commands queue until
-    // it returns. Kill the worker so the next summarize starts fresh.
     try {
       await _summarizationService.recoverFromStuckGeneration();
       _isModelLoaded = false;
@@ -263,22 +354,23 @@ class SummarizationProvider extends ChangeNotifier {
   void clear() {
     _generationDeadlineTimer?.cancel();
     _firstTokenDeadlineTimer?.cancel();
+    _firstTokenGraceActive = false;
     _summary = '';
     _errorMessage = null;
     _wasTranscriptTruncated = false;
-    _status = SummarizationStatus.idle;
+    _setPhase(SummarizationPhase.idle);
     notifyListeners();
   }
 
-  /// Aborts an in-progress generation immediately and transitions to idle.
   Future<void> cancelGeneration() async {
-    if (_status != SummarizationStatus.generating) {
+    if (!isGenerating) {
       return;
     }
     AppLogger.log('SUMMARIZE', 'User requested cancel generation');
     _generationDeadlineTimer?.cancel();
     _firstTokenDeadlineTimer?.cancel();
-    _status = SummarizationStatus.idle;
+    _firstTokenGraceActive = false;
+    _setPhase(SummarizationPhase.idle);
     _errorMessage = null;
     notifyListeners();
     unawaited(_summarizationService.abortStream());

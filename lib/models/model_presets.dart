@@ -1,3 +1,12 @@
+/// How summarization builds the prompt before native generation.
+enum ModelPromptMode {
+  /// Raw string passed to [bridge_session_stream].
+  plainEcho,
+
+  /// [llama_chat_apply_template] via [bridge_session_stream_chat].
+  nativeChatTemplate,
+}
+
 class AppModelPreset {
   const AppModelPreset({
     required this.id,
@@ -7,6 +16,11 @@ class AppModelPreset {
     this.expectedSha256,
     this.expectedBytes,
     this.recommendedForMobile = false,
+    this.mobileNCtx = 256,
+    this.mobileMaxOutputTokens = 64,
+    this.mobileMaxTranscriptChars = 500,
+    this.mobileGpuLayers = 0,
+    this.promptMode = ModelPromptMode.nativeChatTemplate,
   });
 
   final String id;
@@ -16,15 +30,55 @@ class AppModelPreset {
   final String? expectedSha256;
   final int? expectedBytes;
 
-  /// True for ≤1.1B models that prefill quickly on phone CPU.
+  /// True for models that prefill quickly on phone CPU.
   final bool recommendedForMobile;
+
+  final int mobileNCtx;
+  final int mobileMaxOutputTokens;
+  final int mobileMaxTranscriptChars;
+  final int mobileGpuLayers;
+  final ModelPromptMode promptMode;
+
+  static const String systemPrompt =
+      'You are a meeting summarizer. The user message is a raw transcript. '
+      'Reply with a short summary in 2 to 4 sentences: main topics, decisions, '
+      'and action items. Never repeat instructions or transcript text.';
+
+  static const String combineSystemPrompt =
+      'You merge partial meeting summaries into one coherent summary. '
+      'Write 2 to 5 complete sentences. Do not list parts or repeat source text. '
+      'Output only the final summary.';
 }
 
 class AppModelPresets {
   static const String defaultModelId = 'llama3_2_1b_q4_k_m';
 
-  // Replace `main` with an immutable HF commit revision once SHA256 is recorded.
   static const List<AppModelPreset> all = <AppModelPreset>[
+    AppModelPreset(
+      id: 'smollm2_360m_q4_k_m',
+      label: 'SmolLM2 360M Instruct (Q4_K_M)',
+      fileName: 'SmolLM2-360M-Instruct-Q4_K_M.gguf',
+      downloadUrl:
+          'https://huggingface.co/bartowski/SmolLM2-360M-Instruct-GGUF/resolve/main/SmolLM2-360M-Instruct-Q4_K_M.gguf',
+      expectedBytes: 270590880,
+      recommendedForMobile: true,
+      mobileNCtx: 512,
+      mobileMaxOutputTokens: 80,
+      mobileMaxTranscriptChars: 600,
+      promptMode: ModelPromptMode.plainEcho,
+    ),
+    AppModelPreset(
+      id: 'qwen2_5_0_5b_q4_k_m',
+      label: 'Qwen2.5 0.5B Instruct (Q4_K_M)',
+      fileName: 'qwen2.5-0.5b-instruct-q4_k_m.gguf',
+      downloadUrl:
+          'https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf',
+      expectedBytes: 417334272,
+      recommendedForMobile: true,
+      mobileNCtx: 512,
+      mobileMaxOutputTokens: 80,
+      mobileMaxTranscriptChars: 600,
+    ),
     AppModelPreset(
       id: 'llama3_2_1b_q4_k_m',
       label: 'Llama 3.2 1B Instruct (Q4_K_M)',
@@ -33,6 +87,9 @@ class AppModelPresets {
           'https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf',
       expectedBytes: 807694464,
       recommendedForMobile: true,
+      mobileNCtx: 512,
+      mobileMaxOutputTokens: 80,
+      mobileMaxTranscriptChars: 600,
     ),
     AppModelPreset(
       id: 'tinyllama_1_1b_q4_k_m',
@@ -42,6 +99,9 @@ class AppModelPresets {
           'https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf',
       expectedBytes: 668788096,
       recommendedForMobile: true,
+      mobileNCtx: 512,
+      mobileMaxOutputTokens: 80,
+      mobileMaxTranscriptChars: 600,
     ),
     AppModelPreset(
       id: 'qwen2_5_1_5b_q4_k_m',
@@ -50,6 +110,8 @@ class AppModelPresets {
       downloadUrl:
           'https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf',
       expectedBytes: 1068800000,
+      mobileMaxOutputTokens: 48,
+      mobileMaxTranscriptChars: 400,
     ),
     AppModelPreset(
       id: 'smollm2_1_7b_q4_k_m',
@@ -58,6 +120,8 @@ class AppModelPresets {
       downloadUrl:
           'https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF/resolve/main/smollm2-1.7b-instruct-q4_k_m.gguf',
       expectedBytes: 1073741824,
+      mobileMaxOutputTokens: 48,
+      mobileMaxTranscriptChars: 400,
     ),
   ];
 
@@ -84,5 +148,16 @@ class AppModelPresets {
 
   static bool isMobileRecommendedPath(String? path) {
     return findByFilePath(path)?.recommendedForMobile ?? false;
+  }
+
+  /// Dropdown suffix for Settings UI.
+  static String tierLabel(AppModelPreset preset) {
+    if (preset.recommendedForMobile) {
+      if (preset.id == defaultModelId) {
+        return ' — balanced (recommended)';
+      }
+      return ' — fast on mobile';
+    }
+    return ' — slow on CPU';
   }
 }

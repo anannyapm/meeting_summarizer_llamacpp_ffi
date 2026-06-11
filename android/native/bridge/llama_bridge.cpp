@@ -205,18 +205,23 @@ int run_stream_with_prompt(BridgeSession *session, llama_model *model,
   const int n_prompt = static_cast<int>(prompt_tokens.size());
   const int n_batch = static_cast<int>(llama_n_batch(context));
   const int kPrefillBatch = std::max(1, std::min(32, n_batch));
-  LOGI("[llama_bridge] prefill decode start n_tokens=%d batch=%d n_batch=%d",
-       n_prompt, kPrefillBatch, n_batch);
+  const bool single_batch_prefill = (n_prompt <= 64);
+  const int prefill_step =
+      single_batch_prefill ? n_prompt : kPrefillBatch;
+  LOGI(
+      "[llama_bridge] prefill decode start n_tokens=%d batch=%d n_batch=%d "
+      "single_batch=%d",
+      n_prompt, prefill_step, n_batch, single_batch_prefill ? 1 : 0);
 
   const auto prefill_start = std::chrono::steady_clock::now();
-  for (int i = 0; i < n_prompt; i += kPrefillBatch) {
+  for (int i = 0; i < n_prompt; i += prefill_step) {
     if (session->abort_requested.load()) {
       LOGI("[llama_bridge] prefill aborted at token %d", i);
       finish_generation();
       return BRIDGE_STATUS_OK;
     }
 
-    const int chunk = std::min(kPrefillBatch, n_prompt - i);
+    const int chunk = std::min(prefill_step, n_prompt - i);
     const auto chunk_start = std::chrono::steady_clock::now();
     llama_batch prompt_batch = llama_batch_init(chunk, 0, 1);
     for (int j = 0; j < chunk; ++j) {
@@ -252,8 +257,15 @@ int run_stream_with_prompt(BridgeSession *session, llama_model *model,
   const auto prefill_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                               std::chrono::steady_clock::now() - prefill_start)
                               .count();
-  LOGI("[llama_bridge] prefill decode done total_ms=%lld",
-       static_cast<long long>(prefill_ms));
+  const double prefill_tok_per_s =
+      prefill_ms > 0
+          ? (static_cast<double>(n_prompt) * 1000.0 /
+             static_cast<double>(prefill_ms))
+          : 0.0;
+  LOGI(
+      "[llama_bridge] prefill decode done total_ms=%lld tok_per_s=%.1f "
+      "n_tokens=%d",
+      static_cast<long long>(prefill_ms), prefill_tok_per_s, n_prompt);
 
   std::vector<char> piece_buffer(512);
   int emitted_tokens = 0;
@@ -706,7 +718,12 @@ int bridge_session_load_model(BridgeSession *session, const char *model_path,
     llama_model_free(model);
     return BRIDGE_STATUS_SAMPLER_INIT_FAILED;
   }
-  // Greedy sampling — fastest path on CPU for short summaries.
+  // Repeat penalty reduces transcript echo on small instruct models; greedy
+  // keeps decode fast on CPU.
+  llama_sampler_chain_add(
+      sampler, llama_sampler_init_penalties(
+                   /*penalty_last_n*/ 64, /*penalty_repeat*/ 1.18f,
+                   /*penalty_freq*/ 0.0f, /*penalty_present*/ 0.0f));
   llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
 
   session->model = model;

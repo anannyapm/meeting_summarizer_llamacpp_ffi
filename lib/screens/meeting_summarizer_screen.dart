@@ -6,7 +6,6 @@ import 'package:ffi_learn/models/summary_record.dart';
 import 'package:ffi_learn/screens/settings_screen.dart';
 import 'package:ffi_learn/providers/recording_provider.dart';
 import 'package:ffi_learn/providers/summarization_provider.dart';
-import 'package:ffi_learn/services/summarization_service.dart';
 import 'package:ffi_learn/providers/summary_history_provider.dart';
 import 'package:ffi_learn/providers/transcription_provider.dart';
 
@@ -579,14 +578,22 @@ class _MeetingSummarizerScreenState extends State<MeetingSummarizerScreen> {
                         ),
                         const SizedBox(height: 6),
                         Text(
-                          summarization.isLoadingModel
-                              ? 'Model loading...'
-                              : (summarization.isModelLoaded
-                                    ? 'Model ready'
-                                    : 'Model not loaded'),
+                          switch (summarization.phase) {
+                            SummarizationPhase.loadingModel =>
+                              'Loading model...',
+                            SummarizationPhase.prefilling =>
+                              'Analyzing transcript...',
+                            SummarizationPhase.streaming =>
+                              'Writing summary...',
+                            _ => summarization.isModelLoaded
+                                ? 'Model ready'
+                                : 'Model not loaded',
+                          },
                           style: TextStyle(
                             fontSize: 12,
-                            color: summarization.isModelLoaded
+                            color: summarization.isGenerating
+                                ? Colors.lightBlueAccent
+                                : summarization.isModelLoaded
                                 ? Colors.greenAccent
                                 : Colors.orangeAccent,
                           ),
@@ -595,9 +602,8 @@ class _MeetingSummarizerScreenState extends State<MeetingSummarizerScreen> {
                             summarization.isModelLoaded) ...[
                           const SizedBox(height: 8),
                           const Text(
-                            'Large model on CPU — summarization may take several '
-                            'minutes. For faster results switch to Llama 3.2 1B '
-                            'or TinyLlama in Settings.',
+                            'For plugin-like speed, use Llama 3.2 1B or '
+                            'SmolLM2 360M in Settings.',
                             style: TextStyle(
                               fontSize: 12,
                               color: Colors.orangeAccent,
@@ -607,9 +613,9 @@ class _MeetingSummarizerScreenState extends State<MeetingSummarizerScreen> {
                         if (summarization.wasTranscriptTruncated) ...[
                           const SizedBox(height: 8),
                           Text(
-                            'Note: transcript was trimmed to the last '
-                            '${SummarizationService.summarizeMaxTranscriptChars} '
-                            'characters for on-device speed.',
+                            'Note: transcript was trimmed to ~'
+                            '${summarization.maxTranscriptChars} '
+                            'characters (start + end) for on-device speed.',
                             style: const TextStyle(
                               fontSize: 12,
                               color: Colors.orangeAccent,
@@ -625,14 +631,35 @@ class _MeetingSummarizerScreenState extends State<MeetingSummarizerScreen> {
                             border: Border.all(color: Colors.grey),
                             borderRadius: BorderRadius.circular(8),
                           ),
-                          child: Text(
-                            isSummaryEmpty
-                                ? 'Summary will appear here...'
-                                : summaryText,
-                            style: TextStyle(
-                              color: isSummaryEmpty ? Colors.grey : Colors.white,
-                            ),
-                          ),
+                          child: isSummaryEmpty && summarization.isPrefilling
+                              ? const Row(
+                                  children: [
+                                    SizedBox(
+                                      width: 16,
+                                      height: 16,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                      ),
+                                    ),
+                                    SizedBox(width: 12),
+                                    Expanded(
+                                      child: Text(
+                                        'Analyzing transcript...',
+                                        style: TextStyle(color: Colors.grey),
+                                      ),
+                                    ),
+                                  ],
+                                )
+                              : Text(
+                                  isSummaryEmpty
+                                      ? 'Summary will appear here...'
+                                      : summaryText,
+                                  style: TextStyle(
+                                    color: isSummaryEmpty
+                                        ? Colors.grey
+                                        : Colors.white,
+                                  ),
+                                ),
                         ),
                         const SizedBox(height: 16),
                         Row(

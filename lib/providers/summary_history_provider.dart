@@ -13,25 +13,29 @@ class SummaryHistoryProvider extends ChangeNotifier {
   List<SummaryRecord> get items => List<SummaryRecord>.unmodifiable(_items);
 
   Future<void> init() async {
-    final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString(_historyKey);
-    if (raw == null || raw.isEmpty) {
-      _items = <SummaryRecord>[];
-      return;
-    }
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_historyKey);
+      if (raw == null || raw.isEmpty) {
+        _items = <SummaryRecord>[];
+        return;
+      }
 
-    final decoded = jsonDecode(raw);
-    if (decoded is! List) {
-      _items = <SummaryRecord>[];
-      return;
-    }
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) {
+        _items = <SummaryRecord>[];
+        return;
+      }
 
-    _items = decoded
-        .whereType<Map<String, dynamic>>()
-        .map(SummaryRecord.fromJson)
-        .toList();
-    _items.sort((a, b) => b.createdAt.compareTo(a.createdAt));
-    notifyListeners();
+      _items = decoded
+          .whereType<Map<String, dynamic>>()
+          .map(SummaryRecord.fromJson)
+          .toList();
+      _items.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+      notifyListeners();
+    } catch (_) {
+      _items = <SummaryRecord>[];
+    }
   }
 
   Future<void> add({

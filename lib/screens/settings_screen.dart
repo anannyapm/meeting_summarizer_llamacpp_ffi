@@ -212,12 +212,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       DropdownButtonFormField<String>(
                         initialValue: _selectedModelId,
                         items: AppModelPresets.all.map((preset) {
-                          final suffix = preset.recommendedForMobile
-                              ? ' — recommended for mobile'
-                              : ' — slow on CPU';
                           return DropdownMenuItem<String>(
                             value: preset.id,
-                            child: Text('${preset.label}$suffix'),
+                            child: Text(
+                              '${preset.label}${AppModelPresets.tierLabel(preset)}',
+                            ),
                           );
                         }).toList(),
                         onChanged: _isDownloadingPreset

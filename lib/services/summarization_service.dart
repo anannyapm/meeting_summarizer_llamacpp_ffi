@@ -26,53 +26,126 @@ class SummarizationResult {
 }
 
 class SummarizationService {
-  SummarizationService({
-    required String? modelPath,
-    this.nCtx = 256,
-    this.nGpuLayers = 0,
-    this.maxOutputTokens = 16,
-  }) : _modelPath = modelPath;
+  SummarizationService({required String? modelPath}) : _modelPath = modelPath;
 
   String? _modelPath;
-  final int nCtx;
-  final int nGpuLayers;
-  final int maxOutputTokens;
 
   /// Per-pass transcript cap for map-reduce on very long meetings.
-  static const int summarizeChunkChars = 500;
-
-  /// Mobile CPU budget — last N chars (matches original fast path).
-  static const int summarizeMaxTranscriptChars = 250;
+  static const int summarizeChunkChars = 600;
 
   int? _loadedNCtx;
+  String? _loadedPresetId;
   bool _lastInputWasTruncated = false;
 
-  /// Whether the most recent summarize call trimmed the transcript for CPU budget.
   bool get lastInputWasTruncated => _lastInputWasTruncated;
 
-  /// Minimal prompt — fewer tokens than chat templates.
-  String _buildSummaryPrompt(String content) {
-    return 'Summarize in one sentence:\n$content';
+  AppModelPreset get _activePreset =>
+      AppModelPresets.findByFilePath(_modelPath) ??
+      AppModelPresets.resolveById(AppModelPresets.defaultModelId);
+
+  int get _effectiveNCtx => _activePreset.mobileNCtx;
+  int get _effectiveMaxOutput => _activePreset.mobileMaxOutputTokens;
+  int get _effectiveMaxTranscriptChars => _activePreset.mobileMaxTranscriptChars;
+  int get _effectiveGpuLayers => _activePreset.mobileGpuLayers;
+
+  int get effectiveMaxTranscriptChars => _effectiveMaxTranscriptChars;
+
+  bool get isMobileRecommendedModel => _activePreset.recommendedForMobile;
+
+  String _buildEchoPrompt(
+    String transcriptSlice, {
+    String systemPrompt = AppModelPreset.systemPrompt,
+  }) {
+    return '''$systemPrompt
+
+Transcript:
+$transcriptSlice
+
+Summary:''';
   }
 
-  bool get isMobileRecommendedModel =>
-      AppModelPresets.isMobileRecommendedPath(_modelPath);
+  /// Chat-template user turn: transcript only (instructions live in system).
+  String _userPromptForSlice(String transcriptSlice) => transcriptSlice;
+
+  String _userPromptForCombine(String partialSummaries) => partialSummaries;
 
   ({String text, bool wasTruncated}) _prepareTranscript(String transcript) {
-    final cleaned = _sanitizeTranscript(transcript.trim());
-    if (cleaned.length <= summarizeMaxTranscriptChars) {
+    final cleaned = transcript.trim();
+    final maxChars = _effectiveMaxTranscriptChars;
+    if (cleaned.length <= maxChars) {
       _lastInputWasTruncated = false;
       return (text: cleaned, wasTruncated: false);
     }
-    final tail = cleaned.substring(cleaned.length - summarizeMaxTranscriptChars);
-    final trimmed = tail.trimLeft();
+    // Opening + recent context beats tail-only (reduces "continue the text" behavior).
+    const headChars = 140;
+    final tailBudget = maxChars - headChars - 5;
+    final head = cleaned.substring(0, headChars).trimRight();
+    final tail = cleaned.substring(cleaned.length - tailBudget).trimLeft();
+    final trimmed = '$head ... $tail';
     _lastInputWasTruncated = true;
     AppLogger.log(
       'SUMMARIZE',
       'Transcript truncated for CPU budget '
-      'from=${cleaned.length} to=${trimmed.length} chars',
+      'from=${cleaned.length} to=${trimmed.length} chars (head+tail)',
     );
     return (text: trimmed, wasTruncated: true);
+  }
+
+  static const String _chatMlImEnd = '\x3C|im_end|>';
+
+  String _cleanSummary(String raw) {
+    var summary = raw.trim();
+    const templateLeaks = <String>[
+      '<|im_start|>',
+      _chatMlImEnd,
+      '<|endoftext|>',
+      '<|eot_id|>',
+      '[/INST]',
+      '</s>',
+      '<s>',
+    ];
+    for (final leak in templateLeaks) {
+      summary = summary.replaceAll(leak, '');
+    }
+    summary = summary.replaceFirst(RegExp(r'^(assistant|user)\s*:\s*', caseSensitive: false), '');
+    summary = summary.replaceFirst(RegExp(r'^(summary|transcript)\s*:\s*', caseSensitive: false), '');
+    for (final prefix in _instructionEchoPrefixes) {
+      if (summary.toLowerCase().startsWith(prefix)) {
+        summary = summary.substring(prefix.length).trimLeft();
+      }
+    }
+    return summary.trim();
+  }
+
+  static const List<String> _instructionEchoPrefixes = <String>[
+    'summarize this meeting transcript',
+    'write 2 to 4 sentences',
+    'write 2-4 sentences',
+    'about the main points',
+    'merge these partial summaries',
+  ];
+
+  bool _looksLikeBadSummary(String summary, String source) {
+    final trimmed = summary.trim();
+    if (trimmed.length < 12) {
+      return true;
+    }
+    final lower = trimmed.toLowerCase();
+    for (final phrase in _instructionEchoPrefixes) {
+      if (lower.contains(phrase)) {
+        return true;
+      }
+    }
+    if (lower.startsWith('summarize ') || lower.startsWith('write ')) {
+      return true;
+    }
+    final normSummary = lower.replaceAll(RegExp(r'\s+'), ' ');
+    final normSource = source.toLowerCase().replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (normSummary.length >= 20 && normSource.contains(normSummary)) {
+      return true;
+    }
+    final probeLen = normSummary.length < 48 ? normSummary.length : 48;
+    return normSource.contains(normSummary.substring(0, probeLen));
   }
 
   NativeBridgeWorkerClient? _worker;
@@ -80,6 +153,7 @@ class SummarizationService {
   bool _modelLoaded = false;
   bool get isModelLoaded => _modelLoaded;
   String? get modelPath => _modelPath;
+  String get activePresetId => _activePreset.id;
 
   Future<void> _ensureSessionReady() async {
     if (_sessionReady && _worker != null) {
@@ -110,11 +184,24 @@ class SummarizationService {
     return match != null ? int.tryParse(match.group(1)!) : null;
   }
 
+  bool _needsReload() {
+    if (!_modelLoaded) {
+      return true;
+    }
+    if (_loadedPresetId != _activePreset.id) {
+      return true;
+    }
+    if (_loadedNCtx != _effectiveNCtx) {
+      return true;
+    }
+    return false;
+  }
+
   Future<void> _loadModelNative() async {
     await _worker!.loadModel(
       modelPath: _modelPath!,
-      nCtx: nCtx,
-      nGpuLayers: nGpuLayers,
+      nCtx: _effectiveNCtx,
+      nGpuLayers: _effectiveGpuLayers,
     );
   }
 
@@ -141,10 +228,16 @@ class SummarizationService {
         final info = await _worker!.modelInfo();
         final runtimeNCtx = _parseRuntimeNCtx(info);
         AppLogger.log('MODEL', 'Runtime info: $info');
-        if (runtimeNCtx != null && runtimeNCtx != nCtx) {
+        if (runtimeNCtx != null && runtimeNCtx != _effectiveNCtx) {
           AppLogger.log(
             'MODEL',
-            'Runtime n_ctx=$runtimeNCtx != configured $nCtx — reloading',
+            'Runtime n_ctx=$runtimeNCtx != configured $_effectiveNCtx — reloading',
+          );
+          await unloadModel();
+        } else if (_loadedPresetId != _activePreset.id) {
+          AppLogger.log(
+            'MODEL',
+            'Preset changed ($_loadedPresetId -> ${_activePreset.id}) — reloading',
           );
           await unloadModel();
         }
@@ -154,20 +247,24 @@ class SummarizationService {
       }
     }
 
-    if (!_modelLoaded) {
+    if (_needsReload()) {
       final watch = Stopwatch()..start();
+      final preset = _activePreset;
       AppLogger.log(
         'MODEL',
-        'Loading model from path=$_modelPath nCtx=$nCtx nGpuLayers=$nGpuLayers',
+        'Loading preset=${preset.id} path=$_modelPath '
+        'nCtx=${preset.mobileNCtx} maxOut=${preset.mobileMaxOutputTokens} '
+        'gpuLayers=${preset.mobileGpuLayers} promptMode=${preset.promptMode}',
       );
       await _loadModelWithRetry();
       _modelLoaded = true;
-      _loadedNCtx = nCtx;
+      _loadedNCtx = _effectiveNCtx;
+      _loadedPresetId = preset.id;
       AppLogger.log('MODEL', 'Model loaded in ${watch.elapsedMilliseconds} ms');
     } else {
       AppLogger.log(
         'MODEL',
-        'Model ready (configured nCtx=$nCtx, tracked=$_loadedNCtx)',
+        'Model ready preset=$_loadedPresetId nCtx=$_loadedNCtx',
       );
     }
   }
@@ -181,6 +278,7 @@ class SummarizationService {
     await _worker!.unloadModel();
     _modelLoaded = false;
     _loadedNCtx = null;
+    _loadedPresetId = null;
     AppLogger.log('MODEL', 'Model unloaded.');
   }
 
@@ -196,20 +294,17 @@ class SummarizationService {
     }
   }
 
-  /// Kills the worker isolate when native generation is blocked and cannot
-  /// process abort/unload commands on the command port.
   Future<void> recoverFromStuckGeneration() async {
     AppLogger.log('SUMMARIZE', 'Recovering from stuck generation (kill worker)');
     try {
       await abortStream();
-    } catch (_) {
-      // Best effort — worker may not be listening.
-    }
+    } catch (_) {}
     final worker = _worker;
     _worker = null;
     _sessionReady = false;
     _modelLoaded = false;
     _loadedNCtx = null;
+    _loadedPresetId = null;
     if (worker != null) {
       await worker.close();
     }
@@ -219,13 +314,6 @@ class SummarizationService {
     await ensureModelLoaded();
     AppLogger.log('MODEL', 'Fetching model info...');
     return _worker!.modelInfo();
-  }
-
-  String _sanitizeTranscript(String transcript) {
-    return transcript
-        .replaceAll(r'\$', '')
-        .replaceAll(r'\(', '')
-        .replaceAll(r'\)', '');
   }
 
   List<String> _chunkTranscript(String transcript) {
@@ -250,15 +338,53 @@ class SummarizationService {
     return chunks.where((chunk) => chunk.isNotEmpty).toList();
   }
 
-  Future<String> _generateSummary(String transcriptSlice) async {
+  Stream<String> _streamSummary(
+    String userPrompt, {
+    String systemPrompt = AppModelPreset.systemPrompt,
+  }) {
+    final preset = _activePreset;
+    final maxTokens = _effectiveMaxOutput;
+    if (preset.promptMode == ModelPromptMode.nativeChatTemplate) {
+      return _worker!.streamChat(
+        systemPrompt: systemPrompt,
+        userPrompt: userPrompt,
+        maxTokens: maxTokens,
+      );
+    }
+    return _worker!.streamEcho(
+      _buildEchoPrompt(userPrompt, systemPrompt: systemPrompt),
+      maxTokens: maxTokens,
+    );
+  }
+
+  Future<String> _generateSummary(
+    String transcriptSlice, {
+    String systemPrompt = AppModelPreset.systemPrompt,
+    bool isCombinePass = false,
+  }) async {
+    final userPrompt = isCombinePass
+        ? _userPromptForCombine(transcriptSlice)
+        : _userPromptForSlice(transcriptSlice);
     final buffer = StringBuffer();
-    await for (final token in _worker!.streamEcho(
-      _buildSummaryPrompt(transcriptSlice),
-      maxTokens: maxOutputTokens,
-    )) {
+    await for (final token in _streamSummary(userPrompt, systemPrompt: systemPrompt)) {
       buffer.write(token);
     }
-    return buffer.toString().trim();
+    var summary = _cleanSummary(buffer.toString());
+    if (_looksLikeBadSummary(summary, transcriptSlice)) {
+      AppLogger.log('SUMMARIZE', 'Bad summary (echo/instruction) — retrying');
+      final retrySystem = isCombinePass
+          ? '${AppModelPreset.combineSystemPrompt} Start directly with the summary.'
+          : 'Reply with only the summary sentences. Do not repeat any instructions.';
+      final retryBuffer = StringBuffer();
+      await for (final token in _streamSummary(
+        transcriptSlice,
+        systemPrompt: retrySystem,
+      )) {
+        retryBuffer.write(token);
+      }
+      summary = _cleanSummary(retryBuffer.toString());
+    }
+    return summary;
   }
 
   Future<SummarizationResult> summarizeToResult(String transcript) async {
@@ -277,8 +403,8 @@ class SummarizationService {
 
     AppLogger.log(
       'SUMMARIZE',
-      'Requested summary. transcriptChars=${cleaned.length} '
-      'chunks=${chunks.length} chunkCap=$summarizeChunkChars nCtx=$nCtx',
+      'Requested summary. preset=${_activePreset.id} transcriptChars=${cleaned.length} '
+      'chunks=${chunks.length} nCtx=$_effectiveNCtx',
     );
 
     if (!wasChunked) {
@@ -320,7 +446,9 @@ class SummarizationService {
         .join('\n\n');
 
     final finalSummary = await _generateSummary(
-      'Combine these partial summaries into one:\n\n$combined',
+      combined,
+      systemPrompt: AppModelPreset.combineSystemPrompt,
+      isCombinePass: true,
     );
 
     return SummarizationResult(
@@ -330,7 +458,6 @@ class SummarizationService {
     );
   }
 
-  /// Synchronous prep so callers can read [lastInputWasTruncated] before streaming.
   String prepareInput(String transcript) {
     return _prepareTranscript(transcript).text;
   }
@@ -348,15 +475,15 @@ class SummarizationService {
     final chunks = _chunkTranscript(cleaned);
     AppLogger.log(
       'SUMMARIZE',
-      'Streaming summary. transcriptChars=${cleaned.length} '
-      'chunks=${chunks.length} chunkCap=$summarizeChunkChars nCtx=$nCtx',
+      'Streaming summary. preset=${_activePreset.id} transcriptChars=${cleaned.length} '
+      'chunks=${chunks.length} nCtx=$_effectiveNCtx',
     );
 
     if (chunks.length == 1) {
-      yield* _worker!.streamEcho(
-        _buildSummaryPrompt(chunks.first),
-        maxTokens: maxOutputTokens,
-      );
+      final summary = await _generateSummary(chunks.first);
+      if (summary.isNotEmpty) {
+        yield summary;
+      }
       return;
     }
 
@@ -385,12 +512,14 @@ class SummarizationService {
         .map((e) => 'Part ${e.key + 1}: ${e.value}')
         .join('\n\n');
 
-    yield* _worker!.streamEcho(
-      _buildSummaryPrompt(
-        'Combine these partial summaries into one:\n\n$combined',
-      ),
-      maxTokens: maxOutputTokens,
+    final finalSummary = await _generateSummary(
+      combined,
+      systemPrompt: AppModelPreset.combineSystemPrompt,
+      isCombinePass: true,
     );
+    if (finalSummary.isNotEmpty) {
+      yield finalSummary;
+    }
   }
 
   Future<void> dispose() async {
@@ -403,6 +532,7 @@ class SummarizationService {
     _sessionReady = false;
     _modelLoaded = false;
     _loadedNCtx = null;
+    _loadedPresetId = null;
   }
 
   Future<void> updateModelPath(String? newPath) async {
