@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:path/path.dart' as p;
 import 'package:provider/provider.dart';
 
 import 'package:ffi_learn/core/app_logger.dart';
@@ -23,28 +22,19 @@ class SettingsScreen extends StatefulWidget {
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
-  late String _selectedModelId;
+  String _selectedModelId = AppModelPresets.defaultModelId;
+  bool _didLoadPreset = false;
   bool _isDownloadingPreset = false;
   String _downloadStatus = '';
   int _lastLoggedDownloadPercent = -1;
 
   @override
-  void initState() {
-    super.initState();
-    _selectedModelId = _inferSelectedModelId(widget.initialModelPath);
-  }
-
-  String _inferSelectedModelId(String? modelPath) {
-    if (modelPath == null || modelPath.isEmpty) {
-      return AppModelPresets.defaultModelId;
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (!_didLoadPreset) {
+      _didLoadPreset = true;
+      _selectedModelId = context.read<SettingsProvider>().selectedModelPresetId;
     }
-    final fileName = p.basename(modelPath);
-    for (final preset in AppModelPresets.all) {
-      if (preset.fileName == fileName) {
-        return preset.id;
-      }
-    }
-    return AppModelPresets.defaultModelId;
   }
 
   String _formatBytes(int bytes) {
@@ -75,6 +65,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       final manager = ModelManager(modelName: preset.fileName);
       final file = await manager.ensureModelDownloaded(
         downloadUrl: Uri.parse(preset.downloadUrl),
+        expectedSha: preset.expectedSha256,
+        expectedBytes: preset.expectedBytes,
         progress: (downloaded, total) {
           if (!mounted) {
             return;
@@ -104,7 +96,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
         return;
       }
 
+      final settings = context.read<SettingsProvider>();
       final summarization = context.read<SummarizationProvider>();
+      await settings.setSelectedModelPreset(preset.id);
+      await settings.refreshModelPath();
+      if (!mounted) {
+        return;
+      }
       AppLogger.log('MODEL', 'Preset downloaded at path=${file.path}');
       await summarization.updateModelPath(file.path);
       final loaded = await summarization.loadModel();
@@ -214,9 +212,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       DropdownButtonFormField<String>(
                         initialValue: _selectedModelId,
                         items: AppModelPresets.all.map((preset) {
+                          final suffix = preset.recommendedForMobile
+                              ? ' — recommended for mobile'
+                              : ' — slow on CPU';
                           return DropdownMenuItem<String>(
                             value: preset.id,
-                            child: Text(preset.label),
+                            child: Text('${preset.label}$suffix'),
                           );
                         }).toList(),
                         onChanged: _isDownloadingPreset

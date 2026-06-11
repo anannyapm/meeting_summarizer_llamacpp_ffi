@@ -14,6 +14,10 @@ extern "C" {
 // - bridge_session_create allocates native state.
 // - Dart MUST call bridge_session_destroy exactly once per successful create.
 //
+// Threading: one bridge_session_stream / bridge_session_stream_chat at a time per
+// session. unload/destroy aborts in-flight generation and waits for the decode loop
+// to finish before freeing model/context memory.
+//
 // Phase 3 ABI: explicit status codes and output pointers.
 // - Return code communicates why a call failed.
 // - Output pointer is set only on success.
@@ -60,7 +64,13 @@ int bridge_session_echo_alloc(BridgeSession *session, const char *input,
                               char **out_string);
 
 int bridge_session_stream(BridgeSession *session, const char *input,
-                          BridgeTokenCallback on_token, void *user_data);
+                          int max_tokens, BridgeTokenCallback on_token,
+                          void *user_data);
+
+int bridge_session_stream_chat(BridgeSession *session,
+                               const char *system_prompt,
+                               const char *user_prompt, int max_tokens,
+                               BridgeTokenCallback on_token, void *user_data);
 
 int bridge_session_load_model(BridgeSession *session, const char *model_path,
                               int n_ctx, int n_gpu_layers);

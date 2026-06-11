@@ -1,6 +1,12 @@
-# Offline Meeting Summarizer (Dart FFI + llama.cpp)
+# ffi_learn — Offline Meeting Summarizer (Dart FFI + llama.cpp)
 
-A Flutter proof-of-concept that runs **local LLM inference on-device** using **Dart FFI** and a custom **C++ bridge** around [llama.cpp](https://github.com/ggml-org/llama.cpp). The app records or accepts meeting transcripts, transcribes speech on-device, and streams an AI-generated summary token-by-token—without sending data to a remote server.
+A Flutter proof-of-concept that runs **local LLM inference on-device** using **Dart FFI** and a custom **C++ bridge** around [llama.cpp](https://github.com/ggml-org/llama.cpp). Capture speech via **live mic** (`speech_to_text`) or **record → Whisper** (`whisper_ggml`), then stream an on-device summary token-by-token—without sending data to a remote server.
+
+This repository pairs a working Flutter app with a long-form walkthrough:
+
+**[Building Local LLM's Using Dart FFI And Llama CPP - Beyond Wrapper Packages.md](./Building%20Local%20LLM's%20Using%20Dart%20FFI%20And%20Llama%20CPP%20-%20Beyond%20Wrapper%20Packages.md)**
+
+Use that document for deep dives (memory ownership, callback design, CMake integration). Use this README for setup, architecture, and day-to-day development.
 
 ---
 
@@ -34,12 +40,12 @@ A Flutter proof-of-concept that runs **local LLM inference on-device** using **D
 
 **Local AI via llama.cpp** runs GGUF models directly on the phone or desktop:
 
-| Benefit | Description |
-|--------|-------------|
+| Benefit | Description                                                |
+| ------- | ---------------------------------------------------------- |
 | Offline | Inference works without network after the model is present |
-| Privacy | Audio and transcripts stay on the device |
-| Latency | No round-trip to an API |
-| Cost | No inference server to operate |
+| Privacy | Audio and transcripts stay on the device                   |
+| Latency | No round-trip to an API                                    |
+| Cost    | No inference server to operate                             |
 
 Flutter is excellent for UI and app logic; it is not built for heavy tensor math. This project follows the standard production pattern:
 
@@ -54,9 +60,10 @@ Most pub.dev “llama” packages hide these layers. This repo shows how to own 
 
 ## Features
 
-- **Meeting summarizer UI** — record → transcribe → summarize with streaming output
-- **On-device speech-to-text** via [`speech_to_text`](https://pub.dev/packages/speech_to_text)
-- **Audio recording** via [`record`](https://pub.dev/packages/record)
+- **Meeting summarizer UI** — live mic or record → transcribe → summarize with streaming output
+- **Live on-device STT** via [`speech_to_text`](https://pub.dev/packages/speech_to_text)
+- **File transcription** via [`whisper_ggml`](https://pub.dev/packages/whisper_ggml) after [`record`](https://pub.dev/packages/record)
+- **Per-model chat templates** via `llama_chat_apply_template()` in the native bridge (no hardcoded ChatML)
 - **Custom native bridge** (`libllama_bridge.so` on Android) compiled with llama.cpp from source
 - **Worker isolate** — `NativeBridgeWorkerClient` runs FFI on a background isolate so the UI stays responsive
 - **Token streaming** — C++ callbacks push tokens to Dart as they are generated
@@ -69,11 +76,11 @@ Most pub.dev “llama” packages hide these layers. This repo shows how to own 
 
 ## Platform support
 
-| Platform | Native bridge | LLM inference | Notes |
-|----------|---------------|---------------|--------|
-| **Android** | ✅ `libllama_bridge.so` | ✅ Primary target | `arm64-v8a` only in `build.gradle.kts` |
-| **iOS** | ⚠️ Partial / planned | ⚠️ | `DynamicLibrary.process()` stub in Dart; full iOS bridge not wired in this POC |
-| **macOS / Linux / Windows** | ❌ | ❌ | Flutter scaffold present; no llama bridge build for desktop yet |
+| Platform                    | Native bridge           | LLM inference     | Notes                                                                          |
+| --------------------------- | ----------------------- | ----------------- | ------------------------------------------------------------------------------ |
+| **Android**                 | ✅ `libllama_bridge.so` | ✅ Primary target | `arm64-v8a` only in `build.gradle.kts`                                         |
+| **iOS**                     | ⚠️ Partial / planned    | ⚠️                | `DynamicLibrary.process()` stub in Dart; full iOS bridge not wired in this POC |
+| **macOS / Linux / Windows** | ❌                      | ❌                | Flutter scaffold present; no llama bridge build for desktop yet                |
 
 Treat **Android (physical device or arm64 emulator)** as the supported path for local LLM features.
 
@@ -132,10 +139,10 @@ User runs Summarize
 
 ### Why FFI instead of platform channels?
 
-| Approach | Best for |
-|----------|----------|
-| **Platform channels** | OS APIs (camera, permissions, billing) |
-| **Dart FFI** | Tight loops, large buffers, streaming callbacks, minimal marshalling |
+| Approach              | Best for                                                             |
+| --------------------- | -------------------------------------------------------------------- |
+| **Platform channels** | OS APIs (camera, permissions, billing)                               |
+| **Dart FFI**          | Tight loops, large buffers, streaming callbacks, minimal marshalling |
 
 Inference is CPU-heavy and chatty (many small token callbacks). FFI avoids serializing through the platform embedder on every step.
 
@@ -294,18 +301,20 @@ Tagged logging uses `lib/core/app_logger.dart`.
 
 ## Model management
 
-| Preset ID | Model | Approx. size (Q4_K_M) |
-|-----------|--------|------------------------|
-| `llama3_2_1b_q4_k_m` (default) | Llama 3.2 1B Instruct | ~800MB |
-| `tinyllama_1_1b_q4_k_m` | TinyLlama 1.1B Chat | ~600MB |
-| `qwen2_5_1_5b_q4_k_m` | Qwen2.5 1.5B Instruct | ~1GB |
-| `smollm2_1_7b_q4_k_m` | SmolLM2 1.7B Instruct | ~1GB |
+| Preset ID                      | Model                 | Approx. size (Q4_K_M) |
+| ------------------------------ | --------------------- | --------------------- |
+| `llama3_2_1b_q4_k_m` (default) | Llama 3.2 1B Instruct | ~800MB                |
+| `tinyllama_1_1b_q4_k_m`        | TinyLlama 1.1B Chat   | ~600MB                |
+| `qwen2_5_1_5b_q4_k_m`          | Qwen2.5 1.5B Instruct | ~1GB                  |
+| `smollm2_1_7b_q4_k_m`          | SmolLM2 1.7B Instruct | ~1GB                  |
 
 `ModelManager`:
 
 - Downloads to `getApplicationDocumentsDirectory()/models/`
 - Reports progress for UI
-- Supports optional SHA-256 verification when configured
+- Streamed SHA-256 verification (no full-file RAM load)
+- Resumable HTTP Range downloads with retry
+- Optional `expectedBytes` / `expectedSha256` per preset
 
 After download, `SummarizationProvider.loadModel()` loads weights through the native bridge (`bridge_session_load_model`).
 
@@ -317,10 +326,21 @@ After download, `SummarizationProvider.loadModel()` loads weights through the na
 
 In `lib/services/summarization_service.dart`:
 
-| Parameter | Default | Effect |
-|-----------|---------|--------|
-| `nCtx` | `256` | Context window; smaller = faster, may truncate long transcripts |
-| `nGpuLayers` | `999` | Offload layers to GPU when available (device-dependent) |
+| Parameter         | Default | Effect                                                     |
+| ----------------- | ------- | ---------------------------------------------------------- |
+| `nCtx`            | `2048`  | Context window; long transcripts are chunked automatically |
+| `maxOutputTokens` | `512`   | Generation cap (stops earlier on EOG)                      |
+| `nGpuLayers`      | `999`   | Offload layers to GPU when available (device-dependent)    |
+
+### Chat templates (per preset)
+
+| Preset                      | Template source                                       |
+| --------------------------- | ----------------------------------------------------- |
+| Llama 3.2 1B (default)      | GGUF embedded Jinja via `llama_chat_apply_template()` |
+| TinyLlama 1.1B Chat         | GGUF embedded template                                |
+| Qwen2.5 1.5B / SmolLM2 1.7B | GGUF embedded template (ChatML-compatible)            |
+
+Do not hardcode `<|im_start|>` / `<|eot_id|>` in Dart—the bridge applies the model's template.
 
 ### Android ABI
 
@@ -350,28 +370,29 @@ The contract lives in `android/native/bridge/llama_bridge.h`. Dart never sees C+
 
 ### Status codes (excerpt)
 
-| Code | Name | Typical cause |
-|------|------|----------------|
-| 0 | `BRIDGE_STATUS_OK` | Success |
-| 1 | `BRIDGE_STATUS_NULL_ARG` | Missing pointer |
-| 8 | `BRIDGE_STATUS_MODEL_NOT_LOADED` | Stream before load |
-| 9 | `BRIDGE_STATUS_MODEL_LOAD_FAILED` | Bad path or corrupt GGUF |
-| 12 | `BRIDGE_STATUS_GENERATION_IN_PROGRESS` | Overlapping stream |
-| 13–14 | Tokenize / decode errors | Prompt or model mismatch |
+| Code  | Name                                   | Typical cause            |
+| ----- | -------------------------------------- | ------------------------ |
+| 0     | `BRIDGE_STATUS_OK`                     | Success                  |
+| 1     | `BRIDGE_STATUS_NULL_ARG`               | Missing pointer          |
+| 8     | `BRIDGE_STATUS_MODEL_NOT_LOADED`       | Stream before load       |
+| 9     | `BRIDGE_STATUS_MODEL_LOAD_FAILED`      | Bad path or corrupt GGUF |
+| 12    | `BRIDGE_STATUS_GENERATION_IN_PROGRESS` | Overlapping stream       |
+| 13–14 | Tokenize / decode errors               | Prompt or model mismatch |
 
 Dart converts non-zero codes to `BridgeNativeException` using `bridge_status_to_cstr()`.
 
 ### Core exports
 
-| Function | Purpose |
-|----------|---------|
-| `bridge_version` | Bridge build identity |
-| `bridge_echo_alloc` | Phase-1 string echo (memory test) |
-| `bridge_session_create` / `destroy` | Session lifecycle |
-| `bridge_session_load_model` / `unload_model` | GGUF load into RAM |
-| `bridge_session_stream` | Run inference; `BridgeTokenCallback` per token |
-| `bridge_session_abort_stream` | Cooperative cancel from any thread |
-| `bridge_session_model_info_alloc` | Debug / UI metadata |
+| Function                                     | Purpose                                                 |
+| -------------------------------------------- | ------------------------------------------------------- |
+| `bridge_version`                             | Bridge build identity                                   |
+| `bridge_echo_alloc`                          | Phase-1 string echo (memory test)                       |
+| `bridge_session_create` / `destroy`          | Session lifecycle                                       |
+| `bridge_session_load_model` / `unload_model` | GGUF load into RAM                                      |
+| `bridge_session_stream`                      | Run inference from a raw prompt; `max_tokens` parameter |
+| `bridge_session_stream_chat`                 | Apply GGUF chat template, then generate                 |
+| `bridge_session_abort_stream`                | Cooperative cancel from any thread                      |
+| `bridge_session_model_info_alloc`            | Debug / UI metadata                                     |
 
 ### Building the native piece
 
@@ -386,19 +407,19 @@ llama.cpp build flags in CMake disable tests, examples, and server to keep compi
 
 ## Dart FFI layer
 
-| File | Responsibility |
-|------|----------------|
-| `native_bridge.dart` | `DynamicLibrary` lookup, `calloc`/`malloc` helpers, session API, token callback registry |
-| `native_bridge_worker.dart` | Isolate protocol: commands, pending completers, token `Stream`s |
-| `summarization_service.dart` | App-facing API: ensure session, load model, `summarizeStream(transcript)` |
-| `summarization_provider.dart` | UI state: loading, streaming text, errors, timeouts |
+| File                          | Responsibility                                                                           |
+| ----------------------------- | ---------------------------------------------------------------------------------------- |
+| `native_bridge.dart`          | `DynamicLibrary` lookup, `calloc`/`malloc` helpers, session API, token callback registry |
+| `native_bridge_worker.dart`   | Isolate protocol: commands, pending completers, token `Stream`s                          |
+| `summarization_service.dart`  | App-facing API: ensure session, load model, `summarizeStream(transcript)`                |
+| `summarization_provider.dart` | UI state: loading, streaming text, errors, timeouts                                      |
 
-### Phases implemented
+### Phases implemented (matches tutorial)
 
-1. **Echo alloc** — prove load + malloc/free discipline  
-2. **Opaque sessions** — `Pointer<BridgeSessionPointer>`  
-3. **Status codes** — no exceptions across the C boundary  
-4. **Streaming callbacks** — `@pragma('vm:entry-point')` for C→Dart token delivery  
+1. **Echo alloc** — prove load + malloc/free discipline
+2. **Opaque sessions** — `Pointer<BridgeSessionPointer>`
+3. **Status codes** — no exceptions across the C boundary
+4. **Streaming callbacks** — `@pragma('vm:entry-point')` for C→Dart token delivery
 
 ### Memory pattern (always use `try` / `finally`)
 
@@ -415,25 +436,23 @@ try {
 
 ## End-to-end flow
 
-1. **Launch** — `main.dart` wires `MultiProvider` (settings, recording, transcription, summarization, history).
-2. **Settings** — User downloads a GGUF preset; path is stored and passed to `SummarizationService.updateModelPath`.
-3. **Meeting screen** — Optional record → STT, or paste transcript manually.
-4. **Summarize** — Provider calls service → worker isolate → `bridge_session_stream`.
-5. **UI** — Summary `String` grows as tokens arrive; history can persist completed summaries.
-
-Prompt truncation and meeting-specific templates are implemented in the summarization service layer (see tutorial for tuning long transcripts).
+1. **Launch** — `SettingsProvider` restores the last selected preset; if the GGUF exists on disk, `SummarizationService` bootstraps with that path.
+2. **Settings** — User downloads a GGUF preset; preset id and path are persisted.
+3. **Meeting screen** — **Live mic** (`speech_to_text`) or **Record → Whisper** (`whisper_ggml`), or paste a manual transcript.
+4. **Summarize** — Provider calls service → worker isolate → `bridge_session_stream_chat` (template-aware).
+5. **UI** — Summary grows as tokens arrive; long transcripts use map-reduce chunking in `SummarizationService`.
 
 ---
 
 ## Performance tuning
 
-| Knob | Mobile suggestion | Tradeoff |
-|------|-------------------|----------|
-| Model | TinyLlama or Llama 3.2 1B Q4_K_M | Quality vs speed vs RAM |
-| `nCtx` | 128–256 | Lower = faster; may clip long meetings |
-| `nGpuLayers` | `999` or tuned layer count | GPU when driver supports it |
-| Transcript length | Truncate to last N chars in prompt | Large speedup with small quality loss |
-| Lifecycle | `unloadModel()` / `dispose()` when idle | Frees hundreds of MB RAM |
+| Knob          | Mobile suggestion                       | Tradeoff                                       |
+| ------------- | --------------------------------------- | ---------------------------------------------- |
+| Model         | TinyLlama or Llama 3.2 1B Q4_K_M        | Quality vs speed vs RAM                        |
+| `nCtx`        | 1024–2048                               | Lower = faster; chunking handles long meetings |
+| `nGpuLayers`  | `999` or tuned layer count              | GPU when driver supports it                    |
+| Whisper model | `tiny` (default) vs `base`              | Accuracy vs download size / RAM                |
+| Lifecycle     | `unloadModel()` / `dispose()` when idle | Frees hundreds of MB RAM                       |
 
 ---
 
@@ -441,9 +460,9 @@ Prompt truncation and meeting-specific templates are implemented in the summariz
 
 Enable **Developer mode** in **Settings** to open `DevModePanel`:
 
-- Inspect bridge version and llama runtime info  
-- Run echo / stream-echo FFI tests without the full meeting flow  
-- Validate isolate + callback wiring in isolation  
+- Full `FfiDebugConsole` (session create/destroy, load/unload, echo, stream)
+- Live bridge version from `bridge_version()` and model info from native
+- Validate isolate + callback wiring before testing the meeting flow
 
 Use this when changing `llama_bridge.cpp` or `native_bridge.dart` before testing the full summarizer UI.
 
@@ -451,27 +470,27 @@ Use this when changing `llama_bridge.cpp` or `native_bridge.dart` before testing
 
 ## Troubleshooting
 
-| Symptom | Likely cause | What to try |
-|---------|--------------|-------------|
-| CMake / NDK build failure | Submodule missing | `git submodule update --init --recursive` |
-| `UnsupportedError: Native bridge...` | Running on unsupported OS | Use Android arm64 |
-| Crash on model load | Wrong path or incomplete download | Check Settings download status; verify file size |
-| No tokens / empty summary | Model not loaded or prompt issue | Logs under `MODEL`; try dev-mode stream echo |
-| UI freezes | FFI on main isolate | Confirm `SummarizationService` uses `NativeBridgeWorkerClient` |
-| OOM / slow device | Model too large | Switch to `tinyllama_1_1b_q4_k_m`; lower `nCtx` |
-| Segfault | FFI memory bug | Audit `calloc`/`malloc`/`bridge_string_free` pairs |
-| Emulator unusably slow | x86 vs ARM, no GPU | Prefer physical arm64 device |
+| Symptom                              | Likely cause                      | What to try                                                    |
+| ------------------------------------ | --------------------------------- | -------------------------------------------------------------- |
+| CMake / NDK build failure            | Submodule missing                 | `git submodule update --init --recursive`                      |
+| `UnsupportedError: Native bridge...` | Running on unsupported OS         | Use Android arm64                                              |
+| Crash on model load                  | Wrong path or incomplete download | Check Settings download status; verify file size               |
+| No tokens / empty summary            | Model not loaded or prompt issue  | Logs under `MODEL`; try dev-mode stream echo                   |
+| UI freezes                           | FFI on main isolate               | Confirm `SummarizationService` uses `NativeBridgeWorkerClient` |
+| OOM / slow device                    | Model too large                   | Switch to `tinyllama_1_1b_q4_k_m`; lower `nCtx`                |
+| Segfault                             | FFI memory bug                    | Audit `calloc`/`malloc`/`bridge_string_free` pairs             |
+| Emulator unusably slow               | x86 vs ARM, no GPU                | Prefer physical arm64 device                                   |
 
 ---
 
 ## Key design decisions
 
-1. **Own the ABI** — Stable C header (`llama_bridge.h`) instead of opaque wrapper packages.  
-2. **Status codes, not C++ exceptions** — Mapped to Dart exceptions at the boundary only.  
-3. **Opaque session handles** — C++ holds `llama_model`, `llama_context`, mutexes, abort flags.  
-4. **Worker isolate** — Required for responsive UI during 30s+ generation.  
-5. **Streaming UX** — Token callbacks beat waiting for a full completion string.  
-6. **Download models** — Avoid bloating APK/AAB with multi-hundred-MB assets.  
+1. **Own the ABI** — Stable C header (`llama_bridge.h`) instead of opaque wrapper packages.
+2. **Status codes, not C++ exceptions** — Mapped to Dart exceptions at the boundary only.
+3. **Opaque session handles** — C++ holds `llama_model`, `llama_context`, mutexes, abort flags.
+4. **Worker isolate** — Required for responsive UI during 30s+ generation.
+5. **Streaming UX** — Token callbacks beat waiting for a full completion string.
+6. **Download models** — Avoid bloating APK/AAB with multi-hundred-MB assets.
 
 ---
 
@@ -479,12 +498,12 @@ Use this when changing `llama_bridge.cpp` or `native_bridge.dart` before testing
 
 Items called out in the POC / article but not fully implemented here:
 
-- First-class **iOS** bridge packaging (static link + Xcode copy phases)  
-- Desktop targets (macOS / Windows) with platform-specific `.dylib` / `.dll`  
-- Remote model registry with checksum pinning  
-- Custom summarization prompt templates in UI  
-- Export / share summaries  
-- Built-in performance profiling (tokens/sec, RAM)  
+- First-class **iOS** bridge packaging (static link + Xcode copy phases)
+- Desktop targets (macOS / Windows) with platform-specific `.dylib` / `.dll`
+- Remote model registry with checksum pinning
+- Custom summarization prompt templates in UI
+- Export / share summaries
+- Built-in performance profiling (tokens/sec, RAM)
 
 ---
 
@@ -500,4 +519,10 @@ Items called out in the POC / article but not fully implemented here:
 
 ---
 
-**Happy building.** For step-by-step FFI phases, CMake snippets, and production lessons learned, start with my article
+## License
+
+No license file is included in this repository yet. Add one before public distribution if you plan to open-source or share the project.
+
+---
+
+**Happy building.** For step-by-step FFI phases, CMake snippets, and production lessons learned, start with the [companion article](./Building%20Local%20LLM's%20Using%20Dart%20FFI%20And%20Llama%20CPP%20-%20Beyond%20Wrapper%20Packages.md).

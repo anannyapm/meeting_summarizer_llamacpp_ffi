@@ -12,6 +12,14 @@ set(LLAMA_BUILD_TOOLS OFF)
 set(LLAMA_BUILD_COMMON OFF)
 set(GGML_LLAMAFILE OFF)
 
+# Android NDK cross-compiles with CMAKE_CROSSCOMPILING=ON, which disables
+# GGML_NATIVE and leaves GGML_CPU_ARM_ARCH empty — ggml then builds ARM quants
+# without -march flags (very slow scalar fallback). Apply -march only on
+# arm64-v8a; armeabi-v7a hits vcvtnq_s32_f32 redefinition with NDK 28+.
+if(ANDROID AND ANDROID_ABI STREQUAL "arm64-v8a")
+    set(GGML_CPU_ARM_ARCH "armv8.2-a+dotprod+fp16" CACHE STRING "" FORCE)
+endif()
+
 add_subdirectory(
     ../llama.cpp
     llama_build

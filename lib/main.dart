@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:ffi_learn/app.dart';
-import 'package:ffi_learn/models/model_presets.dart';
 import 'package:ffi_learn/providers/recording_provider.dart';
 import 'package:ffi_learn/providers/settings_provider.dart';
 import 'package:ffi_learn/providers/summarization_provider.dart';
@@ -11,26 +10,19 @@ import 'package:ffi_learn/services/recording_service.dart';
 import 'package:ffi_learn/services/summarization_service.dart';
 import 'package:ffi_learn/services/transcription_service.dart';
 
-AppModelPreset _resolveBootstrapModel() {
-  const requestedId = String.fromEnvironment(
-    'MODEL_PRESET',
-    defaultValue: AppModelPresets.defaultModelId,
-  );
-  return AppModelPresets.resolveById(requestedId);
-}
-
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Initialize settings provider
   final settingsProvider = SettingsProvider();
   await settingsProvider.init();
   final summaryHistoryProvider = SummaryHistoryProvider();
   await summaryHistoryProvider.init();
 
-  // Select default model preset.
-  final selectedModel = _resolveBootstrapModel();
-  debugPrint('Using model preset: ${selectedModel.id}');
+  final initialModelPath = settingsProvider.resolvedModelPath;
+  debugPrint(
+    'Bootstrap model preset=${settingsProvider.selectedModelPresetId} '
+    'path=${initialModelPath ?? "not downloaded"}',
+  );
 
   runApp(
     MultiProvider(
@@ -46,15 +38,14 @@ void main() async {
         ),
         ChangeNotifierProvider<SummarizationProvider>(
           create: (_) => SummarizationProvider(
-            SummarizationService(modelPath: null),
+            SummarizationService(modelPath: initialModelPath),
           ),
         ),
         ChangeNotifierProvider<SummaryHistoryProvider>.value(
           value: summaryHistoryProvider,
         ),
       ],
-      child: const App(),
+      child: App(initialModelPath: initialModelPath),
     ),
   );
 }
-

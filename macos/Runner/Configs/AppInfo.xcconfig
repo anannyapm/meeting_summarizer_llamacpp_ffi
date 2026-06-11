@@ -8,7 +8,7 @@
 PRODUCT_NAME = ffi_learn
 
 // The application's bundle identifier
-PRODUCT_BUNDLE_IDENTIFIER = com.example.ffiLearn
+PRODUCT_BUNDLE_IDENTIFIER = com.learn.meetsummarizer
 
 // The copyright displayed in application information
-PRODUCT_COPYRIGHT = Copyright © 2026 com.example. All rights reserved.
+PRODUCT_COPYRIGHT = Copyright © 2026 com.learn. All rights reserved.

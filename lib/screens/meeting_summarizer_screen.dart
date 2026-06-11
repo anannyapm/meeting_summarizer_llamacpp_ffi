@@ -4,9 +4,13 @@ import 'package:provider/provider.dart';
 import 'package:ffi_learn/core/app_logger.dart';
 import 'package:ffi_learn/models/summary_record.dart';
 import 'package:ffi_learn/screens/settings_screen.dart';
+import 'package:ffi_learn/providers/recording_provider.dart';
 import 'package:ffi_learn/providers/summarization_provider.dart';
+import 'package:ffi_learn/services/summarization_service.dart';
 import 'package:ffi_learn/providers/summary_history_provider.dart';
 import 'package:ffi_learn/providers/transcription_provider.dart';
+
+enum _CaptureMode { liveMic, recordAndTranscribe }
 
 /// Main meeting summarizer screen
 /// This is the primary UI for recording, transcribing, and summarizing meetings
@@ -25,6 +29,7 @@ class MeetingSummarizerScreen extends StatefulWidget {
 
 class _MeetingSummarizerScreenState extends State<MeetingSummarizerScreen> {
   late final TextEditingController _manualTranscriptController;
+  _CaptureMode _captureMode = _CaptureMode.liveMic;
 
   @override
   void initState() {
@@ -34,7 +39,10 @@ class _MeetingSummarizerScreenState extends State<MeetingSummarizerScreen> {
       if (!mounted) {
         return;
       }
-      context.read<SummarizationProvider>().loadModel();
+      final path = widget.initialModelPath;
+      if (path != null && path.isNotEmpty) {
+        context.read<SummarizationProvider>().loadModel();
+      }
     });
   }
 
@@ -44,12 +52,9 @@ class _MeetingSummarizerScreenState extends State<MeetingSummarizerScreen> {
     super.dispose();
   }
 
-  Future<void> _startSession() async {
+  Future<void> _startLiveSession() async {
     final transcription = context.read<TranscriptionProvider>();
-    AppLogger.log('UI', 'Start Meeting tapped');
-
-    // On many devices, speech_to_text and audio recording cannot run together.
-    // Prioritize live transcript capture for summarization workflow.
+    AppLogger.log('UI', 'Start live mic session');
     await transcription.startListening();
     if (!mounted) {
       return;
@@ -62,10 +67,9 @@ class _MeetingSummarizerScreenState extends State<MeetingSummarizerScreen> {
     }
   }
 
-  Future<void> _stopSession() async {
+  Future<void> _stopLiveSession() async {
     final transcription = context.read<TranscriptionProvider>();
-    AppLogger.log('UI', 'Stop Meeting tapped');
-
+    AppLogger.log('UI', 'Stop live mic session');
     await transcription.stopListening();
     if (!mounted) {
       return;
@@ -76,6 +80,57 @@ class _MeetingSummarizerScreenState extends State<MeetingSummarizerScreen> {
         SnackBar(content: Text(transcription.errorMessage!)),
       );
     }
+  }
+
+  Future<void> _startRecording() async {
+    final recording = context.read<RecordingProvider>();
+    AppLogger.log('UI', 'Start recording');
+    await recording.startRecording();
+    if (!mounted) {
+      return;
+    }
+    if (recording.errorMessage != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(recording.errorMessage!)),
+      );
+    }
+  }
+
+  Future<void> _stopRecordingAndTranscribe() async {
+    final recording = context.read<RecordingProvider>();
+    final transcription = context.read<TranscriptionProvider>();
+    AppLogger.log('UI', 'Stop recording and transcribe');
+
+    final path = await recording.stopRecording();
+    if (!mounted) {
+      return;
+    }
+    if (path == null || path.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No recording saved.')),
+      );
+      return;
+    }
+
+    await transcription.transcribeRecordingFile(path);
+    if (!mounted) {
+      return;
+    }
+    if (transcription.errorMessage != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(transcription.errorMessage!)),
+      );
+    } else if (transcription.hasTranscript) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Recording transcribed on-device.')),
+      );
+    }
+  }
+
+  String _formatDuration(Duration duration) {
+    final minutes = duration.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final seconds = duration.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return '$minutes:$seconds';
   }
 
   Future<void> _summarize() async {
@@ -217,90 +272,188 @@ class _MeetingSummarizerScreenState extends State<MeetingSummarizerScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            // Recording Section
-            Consumer<TranscriptionProvider>(
-              builder: (context, transcription, _) {
-                final isListening = transcription.isListening;
-                final statusLabel = switch (transcription.status) {
-                  TranscriptionStatus.idle => 'Ready to capture speech',
-                  TranscriptionStatus.listening => 'Listening in progress',
-                  TranscriptionStatus.stopped => 'Capture stopped',
-                  TranscriptionStatus.error => 'Capture error',
-                };
-
-                return Card(
-                  child: Padding(
-                    padding: const EdgeInsets.all(16.0),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text(
-                          'Recording',
-                          style: TextStyle(
-                            fontSize: 16,
-                            fontWeight: FontWeight.bold,
-                          ),
+            // Capture Section
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Capture',
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    SegmentedButton<_CaptureMode>(
+                      segments: const [
+                        ButtonSegment(
+                          value: _CaptureMode.liveMic,
+                          label: Text('Live mic'),
+                          icon: Icon(Icons.mic),
                         ),
-                        const SizedBox(height: 16),
-                        Container(
-                          height: 120,
-                          decoration: BoxDecoration(
-                            border: Border.all(
-                              color: isListening ? Colors.greenAccent : Colors.grey,
-                            ),
-                            borderRadius: BorderRadius.circular(8),
-                          ),
-                          child: Center(
-                            child: Column(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                Icon(
-                                  isListening ? Icons.mic : Icons.mic_none,
-                                  size: 32,
-                                  color: isListening
-                                      ? Colors.greenAccent
-                                      : Colors.white70,
-                                ),
-                                const SizedBox(height: 8),
-                                Text(statusLabel),
-                                const SizedBox(height: 4),
-                                const Text(
-                                  'Live transcript mode (mic)',
-                                  style: TextStyle(fontSize: 12, color: Colors.grey),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                        const SizedBox(height: 16),
-                        Row(
-                          children: [
-                            Expanded(
-                              child: ElevatedButton.icon(
-                                icon: const Icon(Icons.mic),
-                                label: const Text('Start Meeting'),
-                                onPressed: !transcription.isListening
-                                    ? _startSession
-                                    : null,
-                              ),
-                            ),
-                            const SizedBox(width: 8),
-                            Expanded(
-                              child: ElevatedButton.icon(
-                                icon: const Icon(Icons.stop),
-                                label: const Text('Stop Meeting'),
-                                onPressed: transcription.isListening
-                                    ? _stopSession
-                                    : null,
-                              ),
-                            ),
-                          ],
+                        ButtonSegment(
+                          value: _CaptureMode.recordAndTranscribe,
+                          label: Text('Record'),
+                          icon: Icon(Icons.fiber_manual_record),
                         ),
                       ],
+                      selected: <_CaptureMode>{_captureMode},
+                      onSelectionChanged: (selection) {
+                        setState(() {
+                          _captureMode = selection.first;
+                        });
+                      },
                     ),
-                  ),
-                );
-              },
+                    const SizedBox(height: 16),
+                    if (_captureMode == _CaptureMode.liveMic)
+                      Consumer<TranscriptionProvider>(
+                        builder: (context, transcription, _) {
+                          final isListening = transcription.isListening;
+                          final statusLabel = switch (transcription.status) {
+                            TranscriptionStatus.idle => 'Ready for live mic STT',
+                            TranscriptionStatus.listening =>
+                              'Listening in progress',
+                            TranscriptionStatus.transcribingFile =>
+                              'Transcribing recording...',
+                            TranscriptionStatus.stopped => 'Capture stopped',
+                            TranscriptionStatus.error => 'Capture error',
+                          };
+
+                          return Column(
+                            children: [
+                              Container(
+                                height: 100,
+                                width: double.infinity,
+                                decoration: BoxDecoration(
+                                  border: Border.all(
+                                    color: isListening
+                                        ? Colors.greenAccent
+                                        : Colors.grey,
+                                  ),
+                                  borderRadius: BorderRadius.circular(8),
+                                ),
+                                child: Center(
+                                  child: Column(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    children: [
+                                      Icon(
+                                        isListening ? Icons.mic : Icons.mic_none,
+                                        color: isListening
+                                            ? Colors.greenAccent
+                                            : Colors.white70,
+                                      ),
+                                      const SizedBox(height: 8),
+                                      Text(statusLabel),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(height: 12),
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: ElevatedButton.icon(
+                                      icon: const Icon(Icons.play_arrow),
+                                      label: const Text('Start'),
+                                      onPressed: !transcription.isListening
+                                          ? _startLiveSession
+                                          : null,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: ElevatedButton.icon(
+                                      icon: const Icon(Icons.stop),
+                                      label: const Text('Stop'),
+                                      onPressed: transcription.isListening
+                                          ? _stopLiveSession
+                                          : null,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          );
+                        },
+                      )
+                    else
+                      Consumer2<RecordingProvider, TranscriptionProvider>(
+                        builder: (context, recording, transcription, _) {
+                          final isRecording = recording.isRecording;
+                          final isTranscribing = transcription.isTranscribingFile;
+                          return Column(
+                            children: [
+                              Container(
+                                height: 100,
+                                width: double.infinity,
+                                decoration: BoxDecoration(
+                                  border: Border.all(
+                                    color: isRecording
+                                        ? Colors.redAccent
+                                        : Colors.grey,
+                                  ),
+                                  borderRadius: BorderRadius.circular(8),
+                                ),
+                                child: Center(
+                                  child: Column(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    children: [
+                                      Icon(
+                                        isRecording
+                                            ? Icons.fiber_manual_record
+                                            : Icons.mic_none,
+                                        color: isRecording
+                                            ? Colors.redAccent
+                                            : Colors.white70,
+                                      ),
+                                      const SizedBox(height: 8),
+                                      Text(
+                                        isTranscribing
+                                            ? 'Transcribing with Whisper...'
+                                            : isRecording
+                                            ? 'Recording ${_formatDuration(recording.elapsed)}'
+                                            : 'Record meeting audio, then transcribe',
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(height: 12),
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: ElevatedButton.icon(
+                                      icon: const Icon(Icons.fiber_manual_record),
+                                      label: const Text('Record'),
+                                      onPressed: recording.canStart &&
+                                              !isTranscribing
+                                          ? _startRecording
+                                          : null,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: ElevatedButton.icon(
+                                      icon: const Icon(Icons.transcribe),
+                                      label: const Text('Stop & Transcribe'),
+                                      onPressed: recording.canStop &&
+                                              !isTranscribing
+                                          ? _stopRecordingAndTranscribe
+                                          : null,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          );
+                        },
+                      ),
+                  ],
+                ),
+              ),
             ),
             const SizedBox(height: 16),
 
@@ -333,7 +486,11 @@ class _MeetingSummarizerScreenState extends State<MeetingSummarizerScreen> {
                               ),
                             ),
                             Text(
-                              transcription.isListening ? 'Listening...' : 'Stopped',
+                              transcription.isListening
+                                  ? 'Listening...'
+                                  : transcription.isTranscribingFile
+                                  ? 'Transcribing...'
+                                  : 'Stopped',
                               style: TextStyle(
                                 fontSize: 12,
                                 color: transcription.isListening
@@ -434,6 +591,31 @@ class _MeetingSummarizerScreenState extends State<MeetingSummarizerScreen> {
                                 : Colors.orangeAccent,
                           ),
                         ),
+                        if (summarization.isSlowModelForMobile &&
+                            summarization.isModelLoaded) ...[
+                          const SizedBox(height: 8),
+                          const Text(
+                            'Large model on CPU — summarization may take several '
+                            'minutes. For faster results switch to Llama 3.2 1B '
+                            'or TinyLlama in Settings.',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Colors.orangeAccent,
+                            ),
+                          ),
+                        ],
+                        if (summarization.wasTranscriptTruncated) ...[
+                          const SizedBox(height: 8),
+                          Text(
+                            'Note: transcript was trimmed to the last '
+                            '${SummarizationService.summarizeMaxTranscriptChars} '
+                            'characters for on-device speed.',
+                            style: const TextStyle(
+                              fontSize: 12,
+                              color: Colors.orangeAccent,
+                            ),
+                          ),
+                        ],
                         const SizedBox(height: 12),
                         Container(
                           constraints: const BoxConstraints(minHeight: 150),

@@ -1,80 +1,35 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+
+import 'package:ffi_learn/providers/settings_provider.dart';
 import 'package:ffi_learn/providers/summarization_provider.dart';
+import 'package:ffi_learn/widgets/ffi_debug_console.dart';
 
-/// Developer mode debug panel - wraps the existing FFI debugging UI
-/// This was previously the main HomePage, now hidden behind dev mode toggle
-class DevModePanel extends StatefulWidget {
-  final String? initialModelPath;
-
+/// Developer mode debug panel with the full FFI debugging console.
+class DevModePanel extends StatelessWidget {
   const DevModePanel({
     super.key,
     this.initialModelPath,
   });
 
-  @override
-  State<DevModePanel> createState() => _DevModePanelState();
-}
+  final String? initialModelPath;
 
-class _DevModePanelState extends State<DevModePanel> {
   @override
   Widget build(BuildContext context) {
+    final modelPath =
+        initialModelPath ?? context.watch<SettingsProvider>().resolvedModelPath;
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('Developer Tools - FFI Debug'),
         backgroundColor: Colors.deepOrange,
       ),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          children: [
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(16.0),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      'Developer Mode Panel',
-                      style: TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    const SizedBox(height: 16),
-                    const Text(
-                      'This panel contains the original FFI debugging interface. '
-                      'You can test the native bridge here.',
-                    ),
-                    const SizedBox(height: 16),
-                    ElevatedButton(
-                      onPressed: () {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(
-                            content: Text(
-                              'FFI Debug Tools - Coming from homepage.dart',
-                            ),
-                          ),
-                        );
-                      },
-                      child: const Text('Test FFI Bridge'),
-                    ),
-                    const SizedBox(height: 16),
-                    if (widget.initialModelPath != null)
-                      Text(
-                        'Model Path: ${widget.initialModelPath}',
-                        style: const TextStyle(
-                          fontSize: 12,
-                          fontStyle: FontStyle.italic,
-                          color: Colors.grey,
-                        ),
-                      ),
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(height: 20),
-            Consumer<SummarizationProvider>(
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Padding(
+            padding: const EdgeInsets.all(16.0),
+            child: Consumer<SummarizationProvider>(
               builder: (context, summarization, _) {
                 return Card(
                   child: Padding(
@@ -83,14 +38,13 @@ class _DevModePanelState extends State<DevModePanel> {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         const Text(
-                          'FFI Bridge Status',
+                          'Meeting Summarizer Bridge',
                           style: TextStyle(
                             fontSize: 14,
                             fontWeight: FontWeight.bold,
                           ),
                         ),
                         const SizedBox(height: 12),
-                        _buildStatusRow('Bridge Version', 'ffi-bridge-phase8'),
                         _buildStatusRow(
                           'Model Loaded',
                           summarization.isModelLoaded ? 'Yes' : 'No',
@@ -99,15 +53,33 @@ class _DevModePanelState extends State<DevModePanel> {
                           'Model Loading',
                           summarization.isLoadingModel ? 'Yes' : 'No',
                         ),
-                        _buildStatusRow('GPU Acceleration', 'Available'),
+                        if (summarization.currentModelPath != null)
+                          _buildStatusRow(
+                            'Model Path',
+                            summarization.currentModelPath!,
+                          ),
                       ],
                     ),
                   ),
                 );
               },
             ),
-          ],
-        ),
+          ),
+          const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 16),
+            child: Text(
+              'Isolated FFI Console',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+              child: FfiDebugConsole(initialModelPath: modelPath),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -116,14 +88,16 @@ class _DevModePanelState extends State<DevModePanel> {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6.0),
       child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(label),
-          Text(
-            value,
-            style: const TextStyle(
-              fontWeight: FontWeight.bold,
-              color: Colors.green,
+          SizedBox(
+            width: 120,
+            child: Text(label),
+          ),
+          Expanded(
+            child: Text(
+              value,
+              style: const TextStyle(fontWeight: FontWeight.bold),
             ),
           ),
         ],

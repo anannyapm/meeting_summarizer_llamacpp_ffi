@@ -16,6 +16,7 @@ const String _kCmdDestroySession = 'destroySession';
 const String _kCmdSetTag = 'setTag';
 const String _kCmdEcho = 'echo';
 const String _kCmdStreamEcho = 'streamEcho';
+const String _kCmdStreamChat = 'streamChat';
 const String _kCmdStreamCancel = 'streamCancel';
 const String _kCmdLoadModel = 'loadModel';
 const String _kCmdUnloadModel = 'unloadModel';
@@ -148,7 +149,35 @@ class NativeBridgeWorkerClient {
     return result as String;
   }
 
-  Stream<String> streamEcho(String input) {
+  Stream<String> streamEcho(String input, {int maxTokens = 512}) {
+    return _startStreamCommand(
+      command: _kCmdStreamEcho,
+      payload: <String, Object?>{
+        'input': input,
+        'maxTokens': maxTokens,
+      },
+    );
+  }
+
+  Stream<String> streamChat({
+    required String systemPrompt,
+    required String userPrompt,
+    int maxTokens = 512,
+  }) {
+    return _startStreamCommand(
+      command: _kCmdStreamChat,
+      payload: <String, Object?>{
+        'systemPrompt': systemPrompt,
+        'userPrompt': userPrompt,
+        'maxTokens': maxTokens,
+      },
+    );
+  }
+
+  Stream<String> _startStreamCommand({
+    required String command,
+    required Map<String, Object?> payload,
+  }) {
     if (_isClosed) {
       return Stream<String>.error(
         const NativeBridgeWorkerException('Worker is closed.'),
@@ -176,8 +205,8 @@ class NativeBridgeWorkerClient {
 
     _commandPort.send(<String, Object?>{
       'id': requestId,
-      'command': _kCmdStreamEcho,
-      'input': input,
+      'command': command,
+      ...payload,
     });
 
     unawaited(() async {
@@ -321,6 +350,40 @@ class NativeBridgeWorkerClient {
   }
 }
 
+void _pipeStreamToClient({
+  required SendPort eventPort,
+  required int requestId,
+  required Stream<String> stream,
+  required Map<int, StreamSubscription<String>> activeStreams,
+}) {
+  final sub = stream.listen(
+    (token) {
+      eventPort.send(<String, Object?>{
+        'type': _kTypeStreamToken,
+        'id': requestId,
+        'token': token,
+      });
+    },
+    onError: (Object error) {
+      eventPort.send(<String, Object?>{
+        'type': _kTypeStreamError,
+        'id': requestId,
+        'error': error.toString(),
+      });
+      activeStreams.remove(requestId);
+    },
+    onDone: () {
+      eventPort.send(<String, Object?>{
+        'type': _kTypeStreamDone,
+        'id': requestId,
+      });
+      activeStreams.remove(requestId);
+    },
+    cancelOnError: true,
+  );
+  activeStreams[requestId] = sub;
+}
+
 @pragma('vm:entry-point')
 void _nativeBridgeWorkerMain(SendPort eventPort) {
   final commandPort = ReceivePort();
@@ -430,36 +493,44 @@ void _nativeBridgeWorkerMain(SendPort eventPort) {
             throw const NativeBridgeWorkerException('Session is not created.');
           }
           final input = message['input'];
+          final maxTokens = message['maxTokens'];
           if (input is! String) {
             throw const NativeBridgeWorkerException('Invalid stream input.');
           }
-          final stream = currentSession.streamEcho(input);
-          final sub = stream.listen(
-            (token) {
-              eventPort.send(<String, Object?>{
-                'type': _kTypeStreamToken,
-                'id': requestId,
-                'token': token,
-              });
-            },
-            onError: (Object error) {
-              eventPort.send(<String, Object?>{
-                'type': _kTypeStreamError,
-                'id': requestId,
-                'error': error.toString(),
-              });
-              activeStreams.remove(requestId);
-            },
-            onDone: () {
-              eventPort.send(<String, Object?>{
-                'type': _kTypeStreamDone,
-                'id': requestId,
-              });
-              activeStreams.remove(requestId);
-            },
-            cancelOnError: true,
+          final stream = currentSession.streamEcho(
+            input,
+            maxTokens: maxTokens is int ? maxTokens : 512,
           );
-          activeStreams[requestId] = sub;
+          _pipeStreamToClient(
+            eventPort: eventPort,
+            requestId: requestId,
+            stream: stream,
+            activeStreams: activeStreams,
+          );
+          sendResponse(requestId, ok: true);
+          break;
+        case _kCmdStreamChat:
+          final chatSession = session;
+          if (chatSession == null) {
+            throw const NativeBridgeWorkerException('Session is not created.');
+          }
+          final systemPrompt = message['systemPrompt'];
+          final userPrompt = message['userPrompt'];
+          final chatMaxTokens = message['maxTokens'];
+          if (systemPrompt is! String || userPrompt is! String) {
+            throw const NativeBridgeWorkerException('Invalid stream chat input.');
+          }
+          final chatStream = chatSession.streamChat(
+            systemPrompt: systemPrompt,
+            userPrompt: userPrompt,
+            maxTokens: chatMaxTokens is int ? chatMaxTokens : 512,
+          );
+          _pipeStreamToClient(
+            eventPort: eventPort,
+            requestId: requestId,
+            stream: chatStream,
+            activeStreams: activeStreams,
+          );
           sendResponse(requestId, ok: true);
           break;
         case _kCmdStreamCancel:

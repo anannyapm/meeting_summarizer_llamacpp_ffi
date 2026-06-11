@@ -49,6 +49,10 @@ final class _BridgeBindings {
           .lookupFunction<_BridgeSessionStreamNative, _BridgeSessionStreamDart>(
             'bridge_session_stream',
           ),
+      bridgeSessionStreamChat = dylib.lookupFunction<
+          _BridgeSessionStreamChatNative, _BridgeSessionStreamChatDart>(
+        'bridge_session_stream_chat',
+      ),
       bridgeSessionLoadModel = dylib
           .lookupFunction<
             _BridgeSessionLoadModelNative,
@@ -80,6 +84,7 @@ final class _BridgeBindings {
   final _BridgeSessionSetTagDart bridgeSessionSetTag;
   final _BridgeSessionEchoAllocDart bridgeSessionEchoAlloc;
   final _BridgeSessionStreamDart bridgeSessionStream;
+  final _BridgeSessionStreamChatDart bridgeSessionStreamChat;
   final _BridgeSessionLoadModelDart bridgeSessionLoadModel;
   final _BridgeSessionUnloadModelDart bridgeSessionUnloadModel;
   final _BridgeSessionModelInfoAllocDart bridgeSessionModelInfoAlloc;
@@ -138,6 +143,7 @@ typedef _BridgeSessionStreamNative =
     Int32 Function(
       Pointer<BridgeSessionPointer>,
       Pointer<Utf8>,
+      Int32,
       Pointer<NativeFunction<_BridgeTokenCallbackNative>>,
       Pointer<Void>,
     );
@@ -145,6 +151,26 @@ typedef _BridgeSessionStreamDart =
     int Function(
       Pointer<BridgeSessionPointer>,
       Pointer<Utf8>,
+      int,
+      Pointer<NativeFunction<_BridgeTokenCallbackNative>>,
+      Pointer<Void>,
+    );
+
+typedef _BridgeSessionStreamChatNative =
+    Int32 Function(
+      Pointer<BridgeSessionPointer>,
+      Pointer<Utf8>,
+      Pointer<Utf8>,
+      Int32,
+      Pointer<NativeFunction<_BridgeTokenCallbackNative>>,
+      Pointer<Void>,
+    );
+typedef _BridgeSessionStreamChatDart =
+    int Function(
+      Pointer<BridgeSessionPointer>,
+      Pointer<Utf8>,
+      Pointer<Utf8>,
+      int,
       Pointer<NativeFunction<_BridgeTokenCallbackNative>>,
       Pointer<Void>,
     );
@@ -333,64 +359,108 @@ class NativeBridgeSession {
     }
   }
 
-  Stream<String> streamEcho(String input) {
+  Stream<String> streamEcho(String input, {int maxTokens = 512}) {
+    return _streamWithNativeCall(
+      operation: 'bridge_session_stream',
+      invoke: (userData) {
+        final inputPtr = input.toNativeUtf8();
+        try {
+          return (
+            status: _bindings.bridgeSessionStream(
+              _pointer,
+              inputPtr,
+              maxTokens,
+              _nativeTokenCallbackPointer,
+              userData,
+            ),
+            cleanup: () => malloc.free(inputPtr),
+          );
+        } catch (error) {
+          malloc.free(inputPtr);
+          rethrow;
+        }
+      },
+    );
+  }
+
+  Stream<String> streamChat({
+    required String systemPrompt,
+    required String userPrompt,
+    int maxTokens = 512,
+  }) {
+    return _streamWithNativeCall(
+      operation: 'bridge_session_stream_chat',
+      invoke: (userData) {
+        final systemPtr = systemPrompt.toNativeUtf8();
+        final userPtr = userPrompt.toNativeUtf8();
+        try {
+          return (
+            status: _bindings.bridgeSessionStreamChat(
+              _pointer,
+              systemPtr,
+              userPtr,
+              maxTokens,
+              _nativeTokenCallbackPointer,
+              userData,
+            ),
+            cleanup: () {
+              malloc.free(systemPtr);
+              malloc.free(userPtr);
+            },
+          );
+        } catch (error) {
+          malloc.free(systemPtr);
+          malloc.free(userPtr);
+          rethrow;
+        }
+      },
+    );
+  }
+
+  Stream<String> _streamWithNativeCall({
+    required String operation,
+    required ({int status, void Function() cleanup}) Function(Pointer<Void> userData)
+        invoke,
+  }) {
     _ensureActive();
 
     if (_activeStreams > 0) {
       throw StateError('Only one active stream is supported per session.');
     }
 
-    late StreamController<String> controller;
-
-    controller = StreamController<String>(sync: true);
-
-    final inputPtr = input.toNativeUtf8();
-
+    final controller = StreamController<String>(sync: true);
     final userData = calloc<Int64>();
-
     final streamId = _nextTokenStreamId++;
-
     userData.value = streamId;
 
     _activeTokenSinks[streamId] = (token) {
-      if (controller.isClosed) {
-        return;
+      if (!controller.isClosed) {
+        controller.add(token);
       }
-
-      controller.add(token);
     };
 
     _activeStreams += 1;
 
     Future.microtask(() {
+      void Function()? cleanup;
       try {
-        final status = _bindings.bridgeSessionStream(
-          _pointer,
-          inputPtr,
-          _nativeTokenCallbackPointer,
-          userData.cast<Void>(),
-        );
-
-        if (status != 0) {
-          _bridgeThrow(status, operation: 'bridge_session_stream');
+        final result = invoke(userData.cast<Void>());
+        cleanup = result.cleanup;
+        if (result.status != 0) {
+          _bridgeThrow(result.status, operation: operation);
         }
       } catch (error, stackTrace) {
         if (!controller.isClosed) {
           controller.addError(error, stackTrace);
         }
       } finally {
+        cleanup?.call();
         _activeTokenSinks.remove(streamId);
-
         calloc.free(userData);
-
-        malloc.free(inputPtr);
-
         _activeStreams -= 1;
-
         if (_isClosing && _activeStreams == 0) {
           _doDispose();
         }
-
         if (!controller.isClosed) {
           controller.close();
         }

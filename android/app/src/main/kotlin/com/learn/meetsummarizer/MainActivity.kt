@@ -1,4 +1,4 @@
-package com.example.ffi_learn
+package com.learn.meetsummarizer
 
 import io.flutter.embedding.android.FlutterActivity
 

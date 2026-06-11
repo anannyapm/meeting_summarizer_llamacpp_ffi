@@ -7,6 +7,21 @@ import 'package:ffi_learn/services/summarization_service.dart';
 
 enum SummarizationStatus { idle, generating, done, error }
 
+// Base timeout; extended automatically for large on-device models.
+const Duration kFirstTokenTimeoutBase = Duration(seconds: 120);
+const Duration kFirstTokenTimeoutMax = Duration(seconds: 420);
+const Duration kTotalGenerationTimeout = Duration(seconds: 420);
+
+/// Rough prefill budget: ~2.5 s per estimated prompt token on 1B-class CPU.
+Duration firstTokenTimeoutForTranscript(int transcriptChars) {
+  final estimatedPromptTokens = (transcriptChars / 2.5).round() + 20;
+  final seconds = (estimatedPromptTokens * 2.5).clamp(
+    kFirstTokenTimeoutBase.inSeconds.toDouble(),
+    kFirstTokenTimeoutMax.inSeconds.toDouble(),
+  ).round();
+  return Duration(seconds: seconds);
+}
+
 class SummarizationProvider extends ChangeNotifier {
   SummarizationProvider(this._summarizationService);
 
@@ -18,6 +33,7 @@ class SummarizationProvider extends ChangeNotifier {
   bool _isLoadingModel = false;
   bool _isModelLoaded = false;
   String _modelInfo = 'Not loaded';
+  bool _wasTranscriptTruncated = false;
   StreamSubscription<String>? _streamSubscription;
   Timer? _generationDeadlineTimer;
   Timer? _firstTokenDeadlineTimer;
@@ -30,6 +46,9 @@ class SummarizationProvider extends ChangeNotifier {
   bool get isLoadingModel => _isLoadingModel;
   bool get isModelLoaded => _isModelLoaded;
   String get modelInfo => _modelInfo;
+  bool get wasTranscriptTruncated => _wasTranscriptTruncated;
+  bool get isSlowModelForMobile =>
+      !_summarizationService.isMobileRecommendedModel;
   String? get currentModelPath => _summarizationService.modelPath;
 
   Future<bool> loadModel() async {
@@ -104,6 +123,7 @@ class SummarizationProvider extends ChangeNotifier {
     _firstTokenDeadlineTimer?.cancel();
     _summary = '';
     _errorMessage = null;
+    _wasTranscriptTruncated = false;
     _status = SummarizationStatus.generating;
     notifyListeners();
 
@@ -116,6 +136,15 @@ class SummarizationProvider extends ChangeNotifier {
           return;
         }
       }
+      _summarizationService.prepareInput(transcript);
+      _wasTranscriptTruncated = _summarizationService.lastInputWasTruncated;
+      notifyListeners();
+      final firstTokenTimeout = firstTokenTimeoutForTranscript(transcript.length);
+      AppLogger.log(
+        'SUMMARIZE',
+        'First-token timeout=${firstTokenTimeout.inSeconds}s '
+        'slowModel=$isSlowModelForMobile',
+      );
       final stream = _summarizationService.summarize(transcript);
       final streamWatch = Stopwatch()..start();
       var tokenCount = 0;
@@ -163,38 +192,40 @@ class SummarizationProvider extends ChangeNotifier {
         cancelOnError: true,
       );
 
-      _firstTokenDeadlineTimer = Timer(const Duration(seconds: 1000), () {
+      _firstTokenDeadlineTimer = Timer(firstTokenTimeout, () {
         if (firstTokenLogged || _status != SummarizationStatus.generating) {
           return;
         }
         AppLogger.log(
           'SUMMARIZE',
-          'First-token deadline reached (1000s), aborting native stream...',
+          'First-token deadline reached (${firstTokenTimeout.inSeconds}s), aborting...',
         );
         _status = SummarizationStatus.error;
-        _errorMessage =
-            'No output in 1000 s — model too slow or stuck. Try a shorter transcript.';
+        _errorMessage = isSlowModelForMobile
+            ? 'No output in ${firstTokenTimeout.inSeconds} s. '
+                'Switch to Llama 3.2 1B or TinyLlama in Settings for faster CPU summarization.'
+            : 'No output in ${firstTokenTimeout.inSeconds} s — model too slow or stuck. '
+                'Try a shorter transcript.';
         notifyListeners();
-        // Signal the native generation loop to stop; this unblocks the worker.
-        unawaited(_summarizationService.abortStream());
-        unawaited(_streamSubscription?.cancel());
+        unawaited(_resetGeneration('first-token timeout'));
       });
 
-      // Hard stop to avoid indefinite loading on slower devices.
-      _generationDeadlineTimer = Timer(const Duration(seconds: 300), () async {
+      _generationDeadlineTimer = Timer(kTotalGenerationTimeout, () async {
         _firstTokenDeadlineTimer?.cancel();
         if (_status == SummarizationStatus.generating) {
-          AppLogger.log('SUMMARIZE', 'Hard 300s deadline reached, aborting...');
-          unawaited(_summarizationService.abortStream());
-          await _streamSubscription?.cancel();
+          AppLogger.log(
+            'SUMMARIZE',
+            'Total deadline reached (${kTotalGenerationTimeout.inSeconds}s), aborting...',
+          );
+          await _resetGeneration('total timeout');
           if (_summary.trim().isNotEmpty) {
             _status = SummarizationStatus.done;
             _errorMessage =
-                'Generation stopped after 60 s. Showing partial summary.';
+                'Generation stopped after ${kTotalGenerationTimeout.inSeconds} s. Showing partial summary.';
           } else {
             _status = SummarizationStatus.error;
             _errorMessage =
-                'Summarization exceeded 60 s without output. Try a shorter transcript.';
+                'Summarization exceeded ${kTotalGenerationTimeout.inSeconds} s without output. Try a shorter transcript.';
           }
           AppLogger.log(
             'SUMMARIZE',
@@ -214,11 +245,27 @@ class SummarizationProvider extends ChangeNotifier {
     }
   }
 
+  Future<void> _resetGeneration(String reason) async {
+    AppLogger.log('SUMMARIZE', 'Resetting generation ($reason)');
+    await _streamSubscription?.cancel();
+    _streamSubscription = null;
+    // Native decode blocks the worker isolate; abort/unload commands queue until
+    // it returns. Kill the worker so the next summarize starts fresh.
+    try {
+      await _summarizationService.recoverFromStuckGeneration();
+      _isModelLoaded = false;
+      _modelInfo = 'Not loaded';
+    } catch (_) {
+      // Ignore recovery errors.
+    }
+  }
+
   void clear() {
     _generationDeadlineTimer?.cancel();
     _firstTokenDeadlineTimer?.cancel();
     _summary = '';
     _errorMessage = null;
+    _wasTranscriptTruncated = false;
     _status = SummarizationStatus.idle;
     notifyListeners();
   }

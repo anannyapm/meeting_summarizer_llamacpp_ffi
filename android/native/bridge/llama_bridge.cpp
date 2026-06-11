@@ -4,15 +4,20 @@
 #include <android/log.h>
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "llama_bridge", __VA_ARGS__)
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <climits>
 #include <cstdio>
+#include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <new>
 #include <string>
+#include <thread>
 #include <vector>
 
 struct BridgeSession {
@@ -24,15 +29,23 @@ struct BridgeSession {
   llama_sampler *sampler = nullptr;
   bool is_generating = false;
   std::mutex mutex;
+  std::condition_variable generation_done;
   // Atomic abort flag — set from any thread, checked by the llama.cpp abort
   // callback after each decode step so generation stops promptly.
   std::atomic<bool> abort_requested{false};
 };
 
 namespace {
+#ifndef NDEBUG
+#define BRIDGE_VERBOSE_LOG(...) LOGI(__VA_ARGS__)
+#else
+#define BRIDGE_VERBOSE_LOG(...) ((void)0)
+#endif
+
 constexpr const char *kBridgeVersion = "ffi-bridge-phase8";
 constexpr size_t kMaxInputBytes = 8192;
-constexpr int kMaxGeneratedTokens = 16;
+constexpr int kDefaultMaxGeneratedTokens = 512;
+constexpr size_t kMaxChatPromptBytes = 65536;
 std::mutex g_llama_backend_mutex;
 int g_llama_backend_users = 0;
 
@@ -86,6 +99,278 @@ int validate_input(const char *input) {
   }
 
   return BRIDGE_STATUS_OK;
+}
+
+int normalize_max_tokens(int max_tokens) {
+  if (max_tokens <= 0) {
+    return kDefaultMaxGeneratedTokens;
+  }
+  return max_tokens;
+}
+
+int validate_chat_prompt(const char *system_prompt, const char *user_prompt) {
+  if (system_prompt == nullptr || user_prompt == nullptr) {
+    return BRIDGE_STATUS_NULL_ARG;
+  }
+  const size_t total_len = std::strlen(system_prompt) + std::strlen(user_prompt);
+  if (total_len == 0) {
+    return BRIDGE_STATUS_EMPTY_INPUT;
+  }
+  if (total_len > kMaxChatPromptBytes) {
+    return BRIDGE_STATUS_INPUT_TOO_LARGE;
+  }
+  return BRIDGE_STATUS_OK;
+}
+
+std::string build_chat_prompt(llama_model *model, const char *system_prompt,
+                              const char *user_prompt) {
+  const char *tmpl = llama_model_chat_template(model, nullptr);
+  llama_chat_message messages[2] = {
+      {"system", system_prompt},
+      {"user", user_prompt},
+  };
+
+  if (tmpl != nullptr && std::strlen(tmpl) > 0) {
+    const int32_t required = llama_chat_apply_template(
+        tmpl, messages, 2, true, nullptr, 0);
+    if (required > 0) {
+      std::vector<char> buffer(static_cast<size_t>(required) + 1);
+      const int32_t written = llama_chat_apply_template(
+          tmpl, messages, 2, true, buffer.data(),
+          static_cast<int32_t>(buffer.size()));
+      if (written > 0) {
+        return std::string(buffer.data(), static_cast<size_t>(written));
+      }
+    }
+  }
+
+  LOGI("[llama_bridge] chat template missing; using plain prompt fallback");
+  return std::string("System: ") + system_prompt + "\nUser: " + user_prompt +
+         "\nAssistant:";
+}
+
+int run_stream_with_prompt(BridgeSession *session, llama_model *model,
+                           llama_context *context, llama_sampler *sampler,
+                           const std::string &prompt, int max_tokens,
+                           BridgeTokenCallback on_token, void *user_data,
+                           const std::function<void()> &finish_generation) {
+  const llama_vocab *vocab = llama_model_get_vocab(model);
+  if (vocab == nullptr) {
+    finish_generation();
+    return BRIDGE_STATUS_MODEL_NOT_LOADED;
+  }
+
+  llama_memory_t memory = llama_get_memory(context);
+  if (memory != nullptr) {
+    llama_memory_clear(memory, false);
+  }
+  llama_sampler_reset(sampler);
+
+  const int32_t prompt_len = static_cast<int32_t>(prompt.size());
+  int32_t prompt_tokens_required =
+      llama_tokenize(vocab, prompt.c_str(), prompt_len, nullptr, 0, true, true);
+  if (prompt_tokens_required == INT32_MIN) {
+    finish_generation();
+    return BRIDGE_STATUS_TOKENIZE_FAILED;
+  }
+  if (prompt_tokens_required < 0) {
+    prompt_tokens_required = -prompt_tokens_required;
+  }
+  if (prompt_tokens_required <= 0) {
+    finish_generation();
+    return BRIDGE_STATUS_TOKENIZE_FAILED;
+  }
+
+  std::vector<llama_token> prompt_tokens(
+      static_cast<size_t>(prompt_tokens_required));
+  const int32_t tokenized = llama_tokenize(
+      vocab, prompt.c_str(), prompt_len, prompt_tokens.data(),
+      prompt_tokens_required, true, true);
+  if (tokenized < 0) {
+    finish_generation();
+    return BRIDGE_STATUS_TOKENIZE_FAILED;
+  }
+  prompt_tokens.resize(static_cast<size_t>(tokenized));
+  if (prompt_tokens.empty()) {
+    finish_generation();
+    return BRIDGE_STATUS_TOKENIZE_FAILED;
+  }
+
+  const int gen_limit = normalize_max_tokens(max_tokens);
+  const uint32_t runtime_ctx = llama_n_ctx(context);
+  LOGI(
+      "[llama_bridge] stream start prompt_tokens=%zu max_gen=%d n_ctx=%u",
+      prompt_tokens.size(), gen_limit, runtime_ctx);
+
+  const int n_prompt = static_cast<int>(prompt_tokens.size());
+  const int n_batch = static_cast<int>(llama_n_batch(context));
+  const int kPrefillBatch = std::max(1, std::min(32, n_batch));
+  LOGI("[llama_bridge] prefill decode start n_tokens=%d batch=%d n_batch=%d",
+       n_prompt, kPrefillBatch, n_batch);
+
+  const auto prefill_start = std::chrono::steady_clock::now();
+  for (int i = 0; i < n_prompt; i += kPrefillBatch) {
+    if (session->abort_requested.load()) {
+      LOGI("[llama_bridge] prefill aborted at token %d", i);
+      finish_generation();
+      return BRIDGE_STATUS_OK;
+    }
+
+    const int chunk = std::min(kPrefillBatch, n_prompt - i);
+    const auto chunk_start = std::chrono::steady_clock::now();
+    llama_batch prompt_batch = llama_batch_init(chunk, 0, 1);
+    for (int j = 0; j < chunk; ++j) {
+      prompt_batch.token[j] = prompt_tokens[static_cast<size_t>(i + j)];
+      prompt_batch.pos[j] = i + j;
+      prompt_batch.n_seq_id[j] = 1;
+      prompt_batch.seq_id[j][0] = 0;
+      prompt_batch.logits[j] = (j == chunk - 1);
+    }
+    prompt_batch.n_tokens = chunk;
+
+    const int decode_result = llama_decode(context, prompt_batch);
+    llama_batch_free(prompt_batch);
+    const auto chunk_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - chunk_start)
+                              .count();
+    LOGI(
+        "[llama_bridge] prefill chunk offset=%d size=%d decode_ms=%lld result=%d",
+        i, chunk, static_cast<long long>(chunk_ms), decode_result);
+    if (decode_result != 0) {
+      if (decode_result < 0) {
+        LOGI("[llama_bridge] prefill decode failed at=%d result=%d", i,
+             decode_result);
+        finish_generation();
+        return BRIDGE_STATUS_DECODE_FAILED;
+      }
+      // decode_result == 1: cooperative abort from abort_callback.
+      LOGI("[llama_bridge] prefill aborted by callback at=%d", i);
+      finish_generation();
+      return BRIDGE_STATUS_OK;
+    }
+  }
+  const auto prefill_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - prefill_start)
+                              .count();
+  LOGI("[llama_bridge] prefill decode done total_ms=%lld",
+       static_cast<long long>(prefill_ms));
+
+  std::vector<char> piece_buffer(512);
+  int emitted_tokens = 0;
+
+  for (int i = 0; i < gen_limit; ++i) {
+    if (session->abort_requested.load()) {
+      break;
+    }
+
+    llama_token token = llama_sampler_sample(sampler, context, -1);
+    if (llama_vocab_is_eog(vocab, token)) {
+      break;
+    }
+
+    int32_t piece_len = llama_token_to_piece(
+        vocab, token, piece_buffer.data(),
+        static_cast<int32_t>(piece_buffer.size()), 0, true);
+    if (piece_len > static_cast<int32_t>(piece_buffer.size())) {
+      piece_buffer.resize(static_cast<size_t>(piece_len));
+      piece_len = llama_token_to_piece(
+          vocab, token, piece_buffer.data(),
+          static_cast<int32_t>(piece_buffer.size()), 0, true);
+    }
+    if (piece_len <= 0) {
+      finish_generation();
+      return BRIDGE_STATUS_DECODE_FAILED;
+    }
+
+    const std::string piece(piece_buffer.data(),
+                            static_cast<size_t>(piece_len));
+    if (emitted_tokens == 0) {
+      LOGI("[llama_bridge] first token emitted len=%d", piece_len);
+    }
+    on_token(piece.c_str(), user_data);
+    emitted_tokens += 1;
+
+    llama_sampler_accept(sampler, token);
+    llama_batch token_batch = llama_batch_get_one(&token, 1);
+    const int loopDecodeResult = llama_decode(context, token_batch);
+    if (loopDecodeResult < 0) {
+      finish_generation();
+      return BRIDGE_STATUS_DECODE_FAILED;
+    }
+  }
+
+  finish_generation();
+  BRIDGE_VERBOSE_LOG("[llama_bridge] stream done emitted_tokens=%d",
+                     emitted_tokens);
+  return BRIDGE_STATUS_OK;
+}
+
+void wait_for_generation_locked(std::unique_lock<std::mutex> &lock,
+                              BridgeSession *session) {
+  session->abort_requested.store(true);
+  while (session->is_generating) {
+    session->generation_done.wait(lock);
+  }
+}
+
+int default_thread_count() {
+  const unsigned hw = std::thread::hardware_concurrency();
+  if (hw <= 2) {
+    return 1;
+  }
+  const int threads = static_cast<int>(hw) - 2;
+#if defined(__ANDROID__)
+  // Use more big cores on modern phones; 2 threads was too conservative.
+  return std::min(4, std::max(2, threads));
+#else
+  return std::min(4, std::max(1, threads));
+#endif
+}
+
+void warmup_context(llama_model *model, llama_context *context) {
+  const llama_vocab *vocab = llama_model_get_vocab(model);
+  if (vocab == nullptr) {
+    return;
+  }
+
+  llama_memory_t memory = llama_get_memory(context);
+  if (memory != nullptr) {
+    llama_memory_clear(memory, false);
+  }
+
+  const char *warmup_text = "Hi";
+  llama_token tokens[8];
+  const int32_t tokenized = llama_tokenize(
+      vocab, warmup_text, 2, tokens, 8, true, true);
+  if (tokenized <= 0) {
+    LOGI("[llama_bridge] warmup skipped (tokenize failed)");
+    return;
+  }
+
+  llama_batch batch = llama_batch_init(tokenized, 0, 1);
+  for (int i = 0; i < tokenized; ++i) {
+    batch.token[i] = tokens[i];
+    batch.pos[i] = i;
+    batch.n_seq_id[i] = 1;
+    batch.seq_id[i][0] = 0;
+    batch.logits[i] = (i == tokenized - 1);
+  }
+  batch.n_tokens = tokenized;
+
+  const auto start = std::chrono::steady_clock::now();
+  const int decode_result = llama_decode(context, batch);
+  llama_batch_free(batch);
+  const auto warmup_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - start)
+          .count();
+  LOGI(
+      "[llama_bridge] warmup decode tokens=%d ms=%lld result=%d",
+      tokenized, static_cast<long long>(warmup_ms), decode_result);
+
+  if (memory != nullptr) {
+    llama_memory_clear(memory, false);
+  }
 }
 
 void unload_model_locked(BridgeSession *session) {
@@ -198,7 +483,8 @@ void bridge_session_destroy(BridgeSession *session) {
     return;
   }
   {
-    std::lock_guard<std::mutex> lock(session->mutex);
+    std::unique_lock<std::mutex> lock(session->mutex);
+    wait_for_generation_locked(lock, session);
     unload_model_locked(session);
   }
   delete session;
@@ -245,11 +531,34 @@ int bridge_session_echo_alloc(BridgeSession *session, const char *input,
   return copy_to_native_string(message, out_string);
 }
 
+int begin_generation(BridgeSession *session, llama_model **out_model,
+                   llama_context **out_context, llama_sampler **out_sampler) {
+  if (session == nullptr || out_model == nullptr || out_context == nullptr ||
+      out_sampler == nullptr) {
+    return BRIDGE_STATUS_NULL_ARG;
+  }
+  std::lock_guard<std::mutex> lock(session->mutex);
+  if (session->model == nullptr || session->context == nullptr) {
+    return BRIDGE_STATUS_MODEL_NOT_LOADED;
+  }
+  if (session->sampler == nullptr) {
+    return BRIDGE_STATUS_SAMPLER_INIT_FAILED;
+  }
+  if (session->is_generating) {
+    return BRIDGE_STATUS_GENERATION_IN_PROGRESS;
+  }
+  session->is_generating = true;
+  session->abort_requested.store(false);
+  session->request_count += 1;
+  *out_model = session->model;
+  *out_context = session->context;
+  *out_sampler = session->sampler;
+  return BRIDGE_STATUS_OK;
+}
+
 int bridge_session_stream(BridgeSession *session, const char *input,
-                          BridgeTokenCallback on_token, void *user_data) {
-                          LOGI(
-        "[llama_bridge] ENTER bridge_session_stream\n");
-  LOGI("ENTER bridge_session_stream");
+                          int max_tokens, BridgeTokenCallback on_token,
+                          void *user_data) {
   if (session == nullptr) {
     return BRIDGE_STATUS_NULL_ARG;
   }
@@ -265,278 +574,60 @@ int bridge_session_stream(BridgeSession *session, const char *input,
   llama_model *model = nullptr;
   llama_context *context = nullptr;
   llama_sampler *sampler = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(session->mutex);
-    if (session->model == nullptr || session->context == nullptr) {
-      return BRIDGE_STATUS_MODEL_NOT_LOADED;
-    }
-    if (session->sampler == nullptr) {
-      return BRIDGE_STATUS_SAMPLER_INIT_FAILED;
-    }
-    if (session->is_generating) {
-      return BRIDGE_STATUS_GENERATION_IN_PROGRESS;
-    }
-    session->is_generating = true;
-    session->abort_requested.store(false);
-    session->request_count += 1;
-    model = session->model;
-    context = session->context;
-    sampler = session->sampler;
-    LOGI(
-    "[llama_bridge] session validated model=%p context=%p sampler=%p\n",
-    model,
-    context,
-    sampler);
+  const int begin_status =
+      begin_generation(session, &model, &context, &sampler);
+  if (begin_status != BRIDGE_STATUS_OK) {
+    return begin_status;
   }
 
   auto finish_generation = [session]() {
     std::lock_guard<std::mutex> lock(session->mutex);
     session->is_generating = false;
+    session->generation_done.notify_all();
   };
 
-  const llama_vocab *vocab = llama_model_get_vocab(model);
-  if (vocab == nullptr) {
-    finish_generation();
-    return BRIDGE_STATUS_MODEL_NOT_LOADED;
-  }
-
-  llama_memory_t memory = llama_get_memory(context);
-  if (memory != nullptr) {
-    llama_memory_clear(memory, false);
-  }
-  llama_sampler_reset(sampler);
-
-  const int32_t prompt_len = static_cast<int32_t>(std::strlen(input));
-  LOGI(
-    "[llama_bridge] before tokenize prompt_len=%d input=%s\n",
-    prompt_len,
-    input);
-  int32_t prompt_tokens_required =
-      llama_tokenize(vocab, input, prompt_len, nullptr, 0, true, true);
-  if (prompt_tokens_required == INT32_MIN) {
-    finish_generation();
-    return BRIDGE_STATUS_TOKENIZE_FAILED;
-  }
-  if (prompt_tokens_required < 0) {
-    prompt_tokens_required = -prompt_tokens_required;
-  }
-  if (prompt_tokens_required <= 0) {
-    finish_generation();
-    return BRIDGE_STATUS_TOKENIZE_FAILED;
-  }
-  LOGI(
-    "[llama_bridge] prompt_tokens_required=%d\n",
-    prompt_tokens_required);
-
-  std::vector<llama_token> prompt_tokens(
-      static_cast<size_t>(prompt_tokens_required));
-  const int32_t tokenized = llama_tokenize(
-      vocab, input, prompt_len, prompt_tokens.data(), prompt_tokens_required,
-      true, true);
-  if (tokenized < 0) {
-    finish_generation();
-    return BRIDGE_STATUS_TOKENIZE_FAILED;
-  }
-  prompt_tokens.resize(static_cast<size_t>(tokenized));
-  LOGI(
-    "[llama_bridge] tokenized successfully token_count=%d\n",
-    tokenized);
-  if (prompt_tokens.empty()) {
-    finish_generation();
-    return BRIDGE_STATUS_TOKENIZE_FAILED;
-  }
-
-LOGI(
-    "[llama_bridge] stream start prompt_tokens=%zu max_gen_tokens=%d",
-    prompt_tokens.size(),
-    kMaxGeneratedTokens);
-
-// =========================
-// INITIAL PROMPT BATCH
-// =========================
-
-llama_batch prompt_batch = llama_batch_init(
-    static_cast<int32_t>(prompt_tokens.size()),
-    0,
-    1);
-
-for (int i = 0; i < prompt_tokens.size(); ++i) {
-    prompt_batch.token[i] = prompt_tokens[i];
-
-    prompt_batch.pos[i] = i;
-
-    prompt_batch.n_seq_id[i] = 1;
-
-    prompt_batch.seq_id[i][0] = 0;
-
-    prompt_batch.logits[i] =
-        (i == prompt_tokens.size() - 1);
+  return run_stream_with_prompt(session, model, context, sampler,
+                                std::string(input), max_tokens, on_token,
+                                user_data, finish_generation);
 }
 
-prompt_batch.n_tokens =
-    static_cast<int32_t>(prompt_tokens.size());
+int bridge_session_stream_chat(BridgeSession *session,
+                               const char *system_prompt,
+                               const char *user_prompt, int max_tokens,
+                               BridgeTokenCallback on_token, void *user_data) {
+  if (session == nullptr) {
+    return BRIDGE_STATUS_NULL_ARG;
+  }
+  if (on_token == nullptr) {
+    return BRIDGE_STATUS_CALLBACK_NULL;
+  }
 
-if (llama_model_has_encoder(model)) {
+  const int prompt_status = validate_chat_prompt(system_prompt, user_prompt);
+  if (prompt_status != BRIDGE_STATUS_OK) {
+    return prompt_status;
+  }
 
-    if (llama_encode(context, prompt_batch) != 0) {
+  llama_model *model = nullptr;
+  llama_context *context = nullptr;
+  llama_sampler *sampler = nullptr;
+  const int begin_status =
+      begin_generation(session, &model, &context, &sampler);
+  if (begin_status != BRIDGE_STATUS_OK) {
+    return begin_status;
+  }
 
-        llama_batch_free(prompt_batch);
+  auto finish_generation = [session]() {
+    std::lock_guard<std::mutex> lock(session->mutex);
+    session->is_generating = false;
+    session->generation_done.notify_all();
+  };
 
-        finish_generation();
-
-        return BRIDGE_STATUS_DECODE_FAILED;
-    }
-
-    llama_token decoder_start =
-        llama_model_decoder_start_token(model);
-
-    if (decoder_start == LLAMA_TOKEN_NULL) {
-        decoder_start = llama_vocab_bos(vocab);
-    }
-
-    prompt_batch =
-        llama_batch_get_one(&decoder_start, 1);
+  const std::string prompt =
+      build_chat_prompt(model, system_prompt, user_prompt);
+  return run_stream_with_prompt(session, model, context, sampler, prompt,
+                                max_tokens, on_token, user_data,
+                                finish_generation);
 }
-
-LOGI("BEFORE FIRST DECODE");
-
-const int firstDecodeResult =
-    llama_decode(context, prompt_batch);
-
-LOGI(
-    "AFTER FIRST DECODE result=%d",
-    firstDecodeResult);
-
-// ONLY free if batch came from llama_batch_init
-llama_batch_free(prompt_batch);
-
-if (firstDecodeResult < 0) {
-
-    finish_generation();
-
-    return BRIDGE_STATUS_DECODE_FAILED;
-}
-
-std::vector<char> piece_buffer(512);
-
-int emitted_tokens = 0;
-
-for (int i = 0; i < kMaxGeneratedTokens; ++i) {
-
-    if (session->abort_requested.load()) {
-
-        LOGI(
-            "[llama_bridge] stream aborted at step=%d",
-            i);
-
-        break;
-    }
-
-    LOGI("sampling step=%d", i);
-
-    llama_token token =
-        llama_sampler_sample(sampler, context, -1);
-
-    if (llama_vocab_is_eog(vocab, token)) {
-
-        LOGI(
-            "[llama_bridge] stream reached EOG at step=%d",
-            i);
-
-        break;
-    }
-
-    int32_t piece_len =
-        llama_token_to_piece(
-            vocab,
-            token,
-            piece_buffer.data(),
-            static_cast<int32_t>(piece_buffer.size()),
-            0,
-            true);
-
-    if (piece_len >
-        static_cast<int32_t>(piece_buffer.size())) {
-
-        piece_buffer.resize(
-            static_cast<size_t>(piece_len));
-
-        piece_len =
-            llama_token_to_piece(
-                vocab,
-                token,
-                piece_buffer.data(),
-                static_cast<int32_t>(piece_buffer.size()),
-                0,
-                true);
-    }
-
-    if (piece_len <= 0) {
-
-        finish_generation();
-
-        return BRIDGE_STATUS_DECODE_FAILED;
-    }
-
-    const std::string piece(
-        piece_buffer.data(),
-        static_cast<size_t>(piece_len));
-if (piece.find("<|im_end|>") != std::string::npos) {
-
-    LOGI("Qwen stop token reached");
-
-    break;
-}
-    LOGI(
-        "[llama_bridge] sending token piece=%s",
-        piece.c_str());
-
-    on_token(piece.c_str(), user_data);
-
-    emitted_tokens += 1;
-
-    if (emitted_tokens == 1 ||
-        emitted_tokens % 8 == 0) {
-
-        LOGI(
-            "[llama_bridge] emitted_tokens=%d",
-            emitted_tokens);
-    }
-
-    llama_sampler_accept(sampler, token);
-
-    // IMPORTANT:
-    // llama_batch_get_one() batch must NOT be freed
-    llama_batch token_batch =
-        llama_batch_get_one(&token, 1);
-
-    LOGI(
-        "[llama_bridge] BEFORE LOOP DECODE step=%d",
-        i);
-
-    const int loopDecodeResult =
-        llama_decode(context, token_batch);
-
-    LOGI(
-        "[llama_bridge] AFTER LOOP DECODE result=%d step=%d",
-        loopDecodeResult,
-        i);
-
-    if (loopDecodeResult < 0) {
-
-        finish_generation();
-
-        return BRIDGE_STATUS_DECODE_FAILED;
-    }
-}
-
-finish_generation();
-
-LOGI(
-    "[llama_bridge] stream done emitted_tokens=%d",
-    emitted_tokens);
-
-return BRIDGE_STATUS_OK;}
 
 int bridge_session_load_model(BridgeSession *session, const char *model_path,
                               int n_ctx, int n_gpu_layers) {
@@ -588,8 +679,12 @@ int bridge_session_load_model(BridgeSession *session, const char *model_path,
     "[llama_bridge] context configured n_ctx=%u\n",
     ctx_params.n_ctx);
   }
-  ctx_params.n_threads = 8;
-  ctx_params.n_threads_batch = 8;
+  const int thread_count = default_thread_count();
+  LOGI("[llama_bridge] using n_threads=%d", thread_count);
+  ctx_params.n_threads = thread_count;
+  ctx_params.n_threads_batch = thread_count;
+  ctx_params.n_batch = 64;
+  ctx_params.n_ubatch = 64;
   // Register an abort callback so bridge_session_abort_stream() can stop an
   // ongoing llama_decode call from another thread.
   ctx_params.abort_callback = [](void *data) -> bool {
@@ -611,15 +706,17 @@ int bridge_session_load_model(BridgeSession *session, const char *model_path,
     llama_model_free(model);
     return BRIDGE_STATUS_SAMPLER_INIT_FAILED;
   }
-  llama_sampler_chain_add(sampler, llama_sampler_init_top_k(40));
-  llama_sampler_chain_add(sampler, llama_sampler_init_top_p(0.95f, 1));
-  llama_sampler_chain_add(sampler, llama_sampler_init_temp(0.8f));
-  llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+  // Greedy sampling — fastest path on CPU for short summaries.
+  llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
 
   session->model = model;
   session->context = context;
   session->sampler = sampler;
   session->loaded_model_path = model_path;
+
+  // Touch mmap'd weights during load so first real prefill is not 60s+ I/O.
+  warmup_context(model, context);
+
   return BRIDGE_STATUS_OK;
 }
 
@@ -627,10 +724,11 @@ int bridge_session_unload_model(BridgeSession *session) {
   if (session == nullptr) {
     return BRIDGE_STATUS_NULL_ARG;
   }
-  std::lock_guard<std::mutex> lock(session->mutex);
+  std::unique_lock<std::mutex> lock(session->mutex);
   if (session->model == nullptr && session->context == nullptr) {
     return BRIDGE_STATUS_MODEL_NOT_LOADED;
   }
+  wait_for_generation_locked(lock, session);
   unload_model_locked(session);
   return BRIDGE_STATUS_OK;
 }
