@@ -19,6 +19,11 @@ class SettingsProvider extends ChangeNotifier {
   String? get resolvedModelPath => _resolvedModelPath;
   bool get hasDownloadedModel => _resolvedModelPath != null;
 
+  bool get initialSetupComplete =>
+      _prefs.getBool(_initialSetupCompleteKey) ?? false;
+
+  static const String _initialSetupCompleteKey = 'initial_setup_complete';
+
   /// Initialize preferences (call this on app startup)
   Future<void> init() async {
     _prefs = await SharedPreferences.getInstance();
@@ -51,6 +56,11 @@ class SettingsProvider extends ChangeNotifier {
   /// Refresh resolved path after a download completes.
   Future<void> refreshModelPath() async {
     await _resolveModelPath();
+    notifyListeners();
+  }
+
+  Future<void> markInitialSetupComplete() async {
+    await _prefs.setBool(_initialSetupCompleteKey, true);
     notifyListeners();
   }
 

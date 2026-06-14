@@ -42,7 +42,10 @@ void main() {
             create: (_) => SummaryHistoryProvider(),
           ),
         ],
-        child: const App(),
+        child: const AppShell(
+          initialModelPath: 'test-model-path',
+          skipInitialSetup: true,
+        ),
       ),
     );
 

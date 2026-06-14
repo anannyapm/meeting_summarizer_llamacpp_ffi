@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 
 import 'package:ffi_learn/app.dart';
 import 'package:ffi_learn/core/app_logger.dart';
+import 'package:ffi_learn/services/model_setup_service.dart';
 import 'package:ffi_learn/providers/recording_provider.dart';
 import 'package:ffi_learn/providers/settings_provider.dart';
 import 'package:ffi_learn/providers/summarization_provider.dart';
@@ -114,7 +115,12 @@ class _AppBootstrapState extends State<AppBootstrap> {
               value: data.summaryHistoryProvider,
             ),
           ],
-          child: App(initialModelPath: data.initialModelPath),
+          child: AppShell(
+            initialModelPath: data.initialModelPath,
+            splashMode: data.initialModelPath != null
+                ? SplashMode.quickLoad
+                : SplashMode.firstLaunch,
+          ),
         );
       },
     );

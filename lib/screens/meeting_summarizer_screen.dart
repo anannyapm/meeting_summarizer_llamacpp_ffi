@@ -34,13 +34,16 @@ class _MeetingSummarizerScreenState extends State<MeetingSummarizerScreen> {
   void initState() {
     super.initState();
     _manualTranscriptController = TextEditingController();
+    // Model is loaded during game splash; loadModel here is a no-op if already warm.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) {
         return;
       }
-      final path = widget.initialModelPath;
-      if (path != null && path.isNotEmpty) {
-        context.read<SummarizationProvider>().loadModel();
+      final summarization = context.read<SummarizationProvider>();
+      if (!summarization.isModelLoaded &&
+          widget.initialModelPath != null &&
+          widget.initialModelPath!.isNotEmpty) {
+        summarization.loadModel();
       }
     });
   }
