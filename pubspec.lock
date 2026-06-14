@@ -216,6 +216,20 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "6.1.0"
+  llama_bridge_core:
+    dependency: "direct main"
+    description:
+      path: "packages/llama_bridge_core"
+      relative: true
+    source: path
+    version: "0.1.0"
+  llama_bridge_flutter:
+    dependency: "direct main"
+    description:
+      path: "packages/llama_bridge_flutter"
+      relative: true
+    source: path
+    version: "0.1.0"
   logging:
     dependency: transitive
     description:

@@ -97,6 +97,8 @@ class NativeBridgeWorkerClient {
     required String modelPath,
     required int nCtx,
     required int nGpuLayers,
+    int nBatch = 64,
+    int nThreads = 4,
   }) async {
     await _sendRequest(
       _kCmdLoadModel,
@@ -104,6 +106,8 @@ class NativeBridgeWorkerClient {
         'modelPath': modelPath,
         'nCtx': nCtx,
         'nGpuLayers': nGpuLayers,
+        'nBatch': nBatch,
+        'nThreads': nThreads,
       },
     );
   }
@@ -549,6 +553,8 @@ void _nativeBridgeWorkerMain(SendPort eventPort) {
           final modelPath = message['modelPath'];
           final nCtx = message['nCtx'];
           final nGpuLayers = message['nGpuLayers'];
+          final nBatch = message['nBatch'];
+          final nThreads = message['nThreads'];
           if (modelPath is! String || nCtx is! int || nGpuLayers is! int) {
             throw const NativeBridgeWorkerException(
               'Invalid load model payload.',
@@ -558,6 +564,8 @@ void _nativeBridgeWorkerMain(SendPort eventPort) {
             modelPath: modelPath,
             nCtx: nCtx,
             nGpuLayers: nGpuLayers,
+            nBatch: nBatch is int ? nBatch : 64,
+            nThreads: nThreads is int ? nThreads : 4,
           );
           sendResponse(requestId, ok: true);
           break;

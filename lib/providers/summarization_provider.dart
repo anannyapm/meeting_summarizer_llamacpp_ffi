@@ -3,7 +3,9 @@ import 'dart:async';
 import 'package:ffi_learn/core/app_logger.dart';
 import 'package:flutter/material.dart';
 
+import 'package:ffi_learn/core/summarization_metrics.dart';
 import 'package:ffi_learn/services/summarization_service.dart';
+import 'package:ffi_learn/summarization/timeout_policy.dart';
 
 enum SummarizationStatus { idle, generating, done, error }
 
@@ -16,18 +18,29 @@ enum SummarizationPhase {
   error,
 }
 
-const Duration kFirstTokenTimeoutBase = Duration(seconds: 120);
-const Duration kFirstTokenTimeoutMax = Duration(seconds: 420);
-const Duration kTotalGenerationTimeout = Duration(seconds: 420);
 const Duration kPostAbortGracePeriod = Duration(seconds: 5);
+const TimeoutPolicy kTimeoutPolicy = TimeoutPolicy();
 
-Duration firstTokenTimeoutForTranscript(int transcriptChars) {
-  final estimatedPromptTokens = (transcriptChars / 2.5).round() + 20;
-  final seconds = (estimatedPromptTokens * 2.5).clamp(
-    kFirstTokenTimeoutBase.inSeconds.toDouble(),
-    kFirstTokenTimeoutMax.inSeconds.toDouble(),
-  ).round();
-  return Duration(seconds: seconds);
+Duration firstTokenTimeoutForTranscript(
+  int transcriptChars, {
+  int chunkCount = 1,
+  bool slowModel = false,
+}) {
+  return kTimeoutPolicy.firstTokenTimeout(
+    transcriptChars: transcriptChars,
+    chunkCount: chunkCount,
+    slowModel: slowModel,
+  );
+}
+
+Duration totalTimeoutForRun({
+  required int chunkCount,
+  required bool slowModel,
+}) {
+  return kTimeoutPolicy.totalTimeout(
+    chunkCount: chunkCount,
+    slowModel: slowModel,
+  );
 }
 
 class SummarizationProvider extends ChangeNotifier {
@@ -67,6 +80,17 @@ class SummarizationProvider extends ChangeNotifier {
       !_summarizationService.isMobileRecommendedModel;
   int get maxTranscriptChars =>
       _summarizationService.effectiveMaxTranscriptChars;
+  SummarizationRunMetrics? get lastRunMetrics =>
+      _summarizationService.lastRunMetrics;
+
+  int _estimatedChunkCount(String transcript) {
+    final prepared = _summarizationService.prepareInput(transcript);
+    if (prepared.length <= SummarizationService.summarizeChunkChars) {
+      return 1;
+    }
+    return (prepared.length / SummarizationService.summarizeChunkChars).ceil();
+  }
+
   String? get currentModelPath => _summarizationService.modelPath;
 
   void _setPhase(SummarizationPhase phase) {
@@ -175,10 +199,20 @@ class SummarizationProvider extends ChangeNotifier {
       _summarizationService.prepareInput(transcript);
       _wasTranscriptTruncated = _summarizationService.lastInputWasTruncated;
       notifyListeners();
-      final firstTokenTimeout = firstTokenTimeoutForTranscript(transcript.length);
+      final chunkCount = _estimatedChunkCount(transcript);
+      final firstTokenTimeout = firstTokenTimeoutForTranscript(
+        transcript.length,
+        chunkCount: chunkCount,
+        slowModel: isSlowModelForMobile,
+      );
+      final totalTimeout = totalTimeoutForRun(
+        chunkCount: chunkCount,
+        slowModel: isSlowModelForMobile,
+      );
       AppLogger.log(
         'SUMMARIZE',
         'First-token timeout=${firstTokenTimeout.inSeconds}s '
+        'total=${totalTimeout.inSeconds}s chunks=$chunkCount '
         'slowModel=$isSlowModelForMobile',
       );
       final stream = _summarizationService.summarize(transcript);
@@ -246,27 +280,24 @@ class SummarizationProvider extends ChangeNotifier {
         unawaited(_handleFirstTokenGrace(firstTokenTimeout));
       });
 
-      _generationDeadlineTimer = Timer(kTotalGenerationTimeout, () async {
+      _generationDeadlineTimer = Timer(totalTimeout, () async {
         _firstTokenDeadlineTimer?.cancel();
         if (isGenerating) {
           AppLogger.log(
             'SUMMARIZE',
-            'Total deadline reached (${kTotalGenerationTimeout.inSeconds}s), aborting...',
+            'Total deadline reached (${totalTimeout.inSeconds}s), aborting...',
           );
-          await _resetGeneration('total timeout');
+          _summarizationService.lastRunMetrics?.recordTimeout('total_timeout');
+          await _softResetGeneration('total timeout');
           if (_summary.trim().isNotEmpty) {
             _setPhase(SummarizationPhase.done);
             _errorMessage =
-                'Generation stopped after ${kTotalGenerationTimeout.inSeconds} s. Showing partial summary.';
+                'Generation stopped after ${totalTimeout.inSeconds} s. Showing partial summary.';
           } else {
             _setPhase(SummarizationPhase.error);
             _errorMessage =
-                'Summarization exceeded ${kTotalGenerationTimeout.inSeconds} s without output. Try a shorter transcript.';
+                'Summarization exceeded ${totalTimeout.inSeconds} s without output. Try a shorter transcript.';
           }
-          AppLogger.log(
-            'SUMMARIZE',
-            'Provider deadline reached phase=$_phase summaryChars=${_summary.length}',
-          );
           notifyListeners();
         }
       });
@@ -335,20 +366,30 @@ class SummarizationProvider extends ChangeNotifier {
         : 'No output in ${firstTokenTimeout.inSeconds} s — model too slow or stuck. '
             'Try a shorter transcript.';
     notifyListeners();
-    await _resetGeneration('first-token timeout');
+    await _softResetGeneration('first-token timeout');
+    if (_phase == SummarizationPhase.error && _summary.trim().isEmpty) {
+      await _hardResetGeneration('first-token hard fallback');
+    }
   }
 
-  Future<void> _resetGeneration(String reason) async {
-    AppLogger.log('SUMMARIZE', 'Resetting generation ($reason)');
+  Future<void> _softResetGeneration(String reason) async {
+    AppLogger.log('SUMMARIZE', 'Soft reset ($reason)');
+    await _streamSubscription?.cancel();
+    _streamSubscription = null;
+    try {
+      await _summarizationService.softRecoverFromStuckGeneration();
+    } catch (_) {}
+  }
+
+  Future<void> _hardResetGeneration(String reason) async {
+    AppLogger.log('SUMMARIZE', 'Hard reset ($reason)');
     await _streamSubscription?.cancel();
     _streamSubscription = null;
     try {
       await _summarizationService.recoverFromStuckGeneration();
       _isModelLoaded = false;
       _modelInfo = 'Not loaded';
-    } catch (_) {
-      // Ignore recovery errors.
-    }
+    } catch (_) {}
   }
 
   void clear() {

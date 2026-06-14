@@ -1,8 +1,12 @@
 import 'dart:async';
 
 import 'package:ffi_learn/core/app_logger.dart';
+import 'package:ffi_learn/core/summarization_metrics.dart';
+import 'package:ffi_learn/models/inference_profile.dart';
 import 'package:ffi_learn/models/model_presets.dart';
 import 'package:ffi_learn/native/native_bridge_worker.dart';
+import 'package:ffi_learn/summarization/chunking_policy.dart';
+import 'package:ffi_learn/summarization/summary_quality_gate.dart';
 
 class SummarizationServiceException implements Exception {
   const SummarizationServiceException(this.message);
@@ -18,11 +22,13 @@ class SummarizationResult {
     required this.summary,
     this.wasChunked = false,
     this.wasTruncated = false,
+    this.metrics,
   });
 
   final String summary;
   final bool wasChunked;
   final bool wasTruncated;
+  final SummarizationRunMetrics? metrics;
 }
 
 class SummarizationService {
@@ -30,27 +36,33 @@ class SummarizationService {
 
   String? _modelPath;
 
-  /// Per-pass transcript cap for map-reduce on very long meetings.
   static const int summarizeChunkChars = 600;
+  static const int chunkOverlapChars = 80;
+
+  final ChunkingPolicy _chunking = const ChunkingPolicy(
+    maxChunkChars: summarizeChunkChars,
+    overlapChars: chunkOverlapChars,
+  );
 
   int? _loadedNCtx;
   String? _loadedPresetId;
   bool _lastInputWasTruncated = false;
+  SummarizationRunMetrics? _lastRunMetrics;
 
   bool get lastInputWasTruncated => _lastInputWasTruncated;
+  SummarizationRunMetrics? get lastRunMetrics => _lastRunMetrics;
 
   AppModelPreset get _activePreset =>
       AppModelPresets.findByFilePath(_modelPath) ??
       AppModelPresets.resolveById(AppModelPresets.defaultModelId);
 
-  int get _effectiveNCtx => _activePreset.mobileNCtx;
-  int get _effectiveMaxOutput => _activePreset.mobileMaxOutputTokens;
-  int get _effectiveMaxTranscriptChars => _activePreset.mobileMaxTranscriptChars;
-  int get _effectiveGpuLayers => _activePreset.mobileGpuLayers;
+  InferenceProfile get _profile => InferenceProfile.fromPreset(_activePreset);
 
-  int get effectiveMaxTranscriptChars => _effectiveMaxTranscriptChars;
-
+  int get effectiveMaxTranscriptChars => _profile.maxTranscriptChars;
   bool get isMobileRecommendedModel => _activePreset.recommendedForMobile;
+  String? get modelPath => _modelPath;
+  String get activePresetId => _activePreset.id;
+  bool get isModelLoaded => _modelLoaded;
 
   String _buildEchoPrompt(
     String transcriptSlice, {
@@ -64,19 +76,16 @@ $transcriptSlice
 Summary:''';
   }
 
-  /// Chat-template user turn: transcript only (instructions live in system).
   String _userPromptForSlice(String transcriptSlice) => transcriptSlice;
-
   String _userPromptForCombine(String partialSummaries) => partialSummaries;
 
   ({String text, bool wasTruncated}) _prepareTranscript(String transcript) {
     final cleaned = transcript.trim();
-    final maxChars = _effectiveMaxTranscriptChars;
+    final maxChars = _profile.maxTranscriptChars;
     if (cleaned.length <= maxChars) {
       _lastInputWasTruncated = false;
       return (text: cleaned, wasTruncated: false);
     }
-    // Opening + recent context beats tail-only (reduces "continue the text" behavior).
     const headChars = 140;
     final tailBudget = maxChars - headChars - 5;
     final head = cleaned.substring(0, headChars).trimRight();
@@ -85,75 +94,14 @@ Summary:''';
     _lastInputWasTruncated = true;
     AppLogger.log(
       'SUMMARIZE',
-      'Transcript truncated for CPU budget '
-      'from=${cleaned.length} to=${trimmed.length} chars (head+tail)',
+      'Transcript truncated from=${cleaned.length} to=${trimmed.length} (head+tail)',
     );
     return (text: trimmed, wasTruncated: true);
-  }
-
-  static const String _chatMlImEnd = '\x3C|im_end|>';
-
-  String _cleanSummary(String raw) {
-    var summary = raw.trim();
-    const templateLeaks = <String>[
-      '<|im_start|>',
-      _chatMlImEnd,
-      '<|endoftext|>',
-      '<|eot_id|>',
-      '[/INST]',
-      '</s>',
-      '<s>',
-    ];
-    for (final leak in templateLeaks) {
-      summary = summary.replaceAll(leak, '');
-    }
-    summary = summary.replaceFirst(RegExp(r'^(assistant|user)\s*:\s*', caseSensitive: false), '');
-    summary = summary.replaceFirst(RegExp(r'^(summary|transcript)\s*:\s*', caseSensitive: false), '');
-    for (final prefix in _instructionEchoPrefixes) {
-      if (summary.toLowerCase().startsWith(prefix)) {
-        summary = summary.substring(prefix.length).trimLeft();
-      }
-    }
-    return summary.trim();
-  }
-
-  static const List<String> _instructionEchoPrefixes = <String>[
-    'summarize this meeting transcript',
-    'write 2 to 4 sentences',
-    'write 2-4 sentences',
-    'about the main points',
-    'merge these partial summaries',
-  ];
-
-  bool _looksLikeBadSummary(String summary, String source) {
-    final trimmed = summary.trim();
-    if (trimmed.length < 12) {
-      return true;
-    }
-    final lower = trimmed.toLowerCase();
-    for (final phrase in _instructionEchoPrefixes) {
-      if (lower.contains(phrase)) {
-        return true;
-      }
-    }
-    if (lower.startsWith('summarize ') || lower.startsWith('write ')) {
-      return true;
-    }
-    final normSummary = lower.replaceAll(RegExp(r'\s+'), ' ');
-    final normSource = source.toLowerCase().replaceAll(RegExp(r'\s+'), ' ').trim();
-    if (normSummary.length >= 20 && normSource.contains(normSummary)) {
-      return true;
-    }
-    final probeLen = normSummary.length < 48 ? normSummary.length : 48;
-    return normSource.contains(normSummary.substring(0, probeLen));
   }
 
   NativeBridgeWorkerClient? _worker;
   bool _sessionReady = false;
   bool _modelLoaded = false;
-  bool get isModelLoaded => _modelLoaded;
-  String? get modelPath => _modelPath;
-  String get activePresetId => _activePreset.id;
 
   Future<void> _ensureSessionReady() async {
     if (_sessionReady && _worker != null) {
@@ -164,18 +112,10 @@ Summary:''';
         'Model path is unavailable. Download a model in Settings first.',
       );
     }
-
-    final sessionWatch = Stopwatch()..start();
-    AppLogger.log('MODEL', 'Ensuring worker/session ready...');
     _worker ??= await NativeBridgeWorkerClient.start();
     if (!_sessionReady) {
-      AppLogger.log('MODEL', 'Creating native session...');
       await _worker!.createSession(tag: 'meeting_summarizer');
       _sessionReady = true;
-      AppLogger.log(
-        'MODEL',
-        'Session ready in ${sessionWatch.elapsedMilliseconds} ms',
-      );
     }
   }
 
@@ -191,81 +131,43 @@ Summary:''';
     if (_loadedPresetId != _activePreset.id) {
       return true;
     }
-    if (_loadedNCtx != _effectiveNCtx) {
+    if (_loadedNCtx != _profile.nCtx) {
       return true;
     }
     return false;
   }
 
   Future<void> _loadModelNative() async {
+    final p = _profile;
     await _worker!.loadModel(
       modelPath: _modelPath!,
-      nCtx: _effectiveNCtx,
-      nGpuLayers: _effectiveGpuLayers,
+      nCtx: p.nCtx,
+      nGpuLayers: p.nGpuLayers,
+      nBatch: p.nBatch,
+      nThreads: p.nThreads,
     );
-  }
-
-  Future<void> _loadModelWithRetry() async {
-    try {
-      await _loadModelNative();
-    } catch (error) {
-      final message = error.toString().toLowerCase();
-      if (message.contains('model_already_loaded')) {
-        AppLogger.log('MODEL', 'Model already loaded in worker — unloading and retrying');
-        await _worker!.unloadModel();
-        await _loadModelNative();
-        return;
-      }
-      rethrow;
-    }
   }
 
   Future<void> ensureModelLoaded() async {
     await _ensureSessionReady();
-
     if (_modelLoaded) {
       try {
         final info = await _worker!.modelInfo();
         final runtimeNCtx = _parseRuntimeNCtx(info);
-        AppLogger.log('MODEL', 'Runtime info: $info');
-        if (runtimeNCtx != null && runtimeNCtx != _effectiveNCtx) {
-          AppLogger.log(
-            'MODEL',
-            'Runtime n_ctx=$runtimeNCtx != configured $_effectiveNCtx — reloading',
-          );
+        if (runtimeNCtx != null && runtimeNCtx != _profile.nCtx) {
           await unloadModel();
         } else if (_loadedPresetId != _activePreset.id) {
-          AppLogger.log(
-            'MODEL',
-            'Preset changed ($_loadedPresetId -> ${_activePreset.id}) — reloading',
-          );
           await unloadModel();
         }
-      } catch (error) {
-        AppLogger.log('MODEL', 'modelInfo failed ($error) — reloading model');
+      } catch (_) {
         await unloadModel();
       }
     }
-
     if (_needsReload()) {
-      final watch = Stopwatch()..start();
-      final preset = _activePreset;
-      AppLogger.log(
-        'MODEL',
-        'Loading preset=${preset.id} path=$_modelPath '
-        'nCtx=${preset.mobileNCtx} maxOut=${preset.mobileMaxOutputTokens} '
-        'gpuLayers=${preset.mobileGpuLayers} promptMode=${preset.promptMode}',
-      );
-      await _loadModelWithRetry();
+      await _loadModelNative();
       _modelLoaded = true;
-      _loadedNCtx = _effectiveNCtx;
-      _loadedPresetId = preset.id;
-      AppLogger.log('MODEL', 'Model loaded in ${watch.elapsedMilliseconds} ms');
-    } else {
-      AppLogger.log(
-        'MODEL',
-        'Model ready preset=$_loadedPresetId nCtx=$_loadedNCtx',
-      );
+      _loadedNCtx = _profile.nCtx;
+      _loadedPresetId = _activePreset.id;
     }
   }
 
@@ -274,28 +176,29 @@ Summary:''';
     if (!_modelLoaded) {
       return;
     }
-    AppLogger.log('MODEL', 'Unloading model...');
     await _worker!.unloadModel();
     _modelLoaded = false;
     _loadedNCtx = null;
     _loadedPresetId = null;
-    AppLogger.log('MODEL', 'Model unloaded.');
   }
 
   Future<void> abortStream() async {
     if (_worker == null || !_sessionReady) {
       return;
     }
-    AppLogger.log('SUMMARIZE', 'Sending abort signal to native session...');
     try {
       await _worker!.abortStream();
-    } catch (_) {
-      // Ignore — worker may already be shutting down.
-    }
+    } catch (_) {}
+  }
+
+  /// Soft recovery: abort in-flight decode but keep worker + loaded model.
+  Future<void> softRecoverFromStuckGeneration() async {
+    AppLogger.log('SUMMARIZE', 'Soft recovery — abort only, keep model loaded');
+    await abortStream();
   }
 
   Future<void> recoverFromStuckGeneration() async {
-    AppLogger.log('SUMMARIZE', 'Recovering from stuck generation (kill worker)');
+    AppLogger.log('SUMMARIZE', 'Hard recovery — kill worker');
     try {
       await abortStream();
     } catch (_) {}
@@ -312,48 +215,26 @@ Summary:''';
 
   Future<String> modelInfo() async {
     await ensureModelLoaded();
-    AppLogger.log('MODEL', 'Fetching model info...');
     return _worker!.modelInfo();
-  }
-
-  List<String> _chunkTranscript(String transcript) {
-    final maxChars = summarizeChunkChars;
-    if (transcript.length <= maxChars) {
-      return <String>[transcript];
-    }
-
-    final chunks = <String>[];
-    var start = 0;
-    while (start < transcript.length) {
-      var end = (start + maxChars).clamp(0, transcript.length);
-      if (end < transcript.length) {
-        final lastSpace = transcript.lastIndexOf(' ', end);
-        if (lastSpace > start) {
-          end = lastSpace;
-        }
-      }
-      chunks.add(transcript.substring(start, end).trim());
-      start = end;
-    }
-    return chunks.where((chunk) => chunk.isNotEmpty).toList();
   }
 
   Stream<String> _streamSummary(
     String userPrompt, {
     String systemPrompt = AppModelPreset.systemPrompt,
+    int? maxTokens,
   }) {
     final preset = _activePreset;
-    final maxTokens = _effectiveMaxOutput;
+    final cap = maxTokens ?? _profile.maxOutputTokens;
     if (preset.promptMode == ModelPromptMode.nativeChatTemplate) {
       return _worker!.streamChat(
         systemPrompt: systemPrompt,
         userPrompt: userPrompt,
-        maxTokens: maxTokens,
+        maxTokens: cap,
       );
     }
     return _worker!.streamEcho(
       _buildEchoPrompt(userPrompt, systemPrompt: systemPrompt),
-      maxTokens: maxTokens,
+      maxTokens: cap,
     );
   }
 
@@ -361,17 +242,30 @@ Summary:''';
     String transcriptSlice, {
     String systemPrompt = AppModelPreset.systemPrompt,
     bool isCombinePass = false,
+    SummarizationRunMetrics? metrics,
+    int? maxTokens,
   }) async {
     final userPrompt = isCombinePass
         ? _userPromptForCombine(transcriptSlice)
         : _userPromptForSlice(transcriptSlice);
     final buffer = StringBuffer();
-    await for (final token in _streamSummary(userPrompt, systemPrompt: systemPrompt)) {
+    await for (final token in _streamSummary(
+      userPrompt,
+      systemPrompt: systemPrompt,
+      maxTokens: maxTokens,
+    )) {
+      if (metrics != null) {
+        metrics.tokenCount += 1;
+        metrics.recordFirstToken(
+          DateTime.now().difference(metrics.startedAt).inMilliseconds,
+        );
+      }
       buffer.write(token);
     }
-    var summary = _cleanSummary(buffer.toString());
-    if (_looksLikeBadSummary(summary, transcriptSlice)) {
-      AppLogger.log('SUMMARIZE', 'Bad summary (echo/instruction) — retrying');
+    var summary = SummaryQualityGate.clean(buffer.toString());
+    if (SummaryQualityGate.isBadSummary(summary, transcriptSlice)) {
+      metrics?.retryCount += 1;
+      AppLogger.log('SUMMARIZE', 'Quality gate failed — retrying');
       final retrySystem = isCombinePass
           ? '${AppModelPreset.combineSystemPrompt} Start directly with the summary.'
           : 'Reply with only the summary sentences. Do not repeat any instructions.';
@@ -379,10 +273,11 @@ Summary:''';
       await for (final token in _streamSummary(
         transcriptSlice,
         systemPrompt: retrySystem,
+        maxTokens: maxTokens,
       )) {
         retryBuffer.write(token);
       }
-      summary = _cleanSummary(retryBuffer.toString());
+      summary = SummaryQualityGate.clean(retryBuffer.toString());
     }
     return summary;
   }
@@ -395,135 +290,190 @@ Summary:''';
         'Transcript is empty. Record and transcribe first.',
       );
     }
-
     await ensureModelLoaded();
-
-    final chunks = _chunkTranscript(cleaned);
-    final wasChunked = chunks.length > 1;
-
-    AppLogger.log(
-      'SUMMARIZE',
-      'Requested summary. preset=${_activePreset.id} transcriptChars=${cleaned.length} '
-      'chunks=${chunks.length} nCtx=$_effectiveNCtx',
+    final chunks = _chunking.chunk(cleaned);
+    final metrics = SummarizationRunMetrics(
+      presetId: _activePreset.id,
+      transcriptChars: cleaned.length,
+      chunkCount: chunks.length,
+      wasTruncated: prepared.wasTruncated,
     );
+    _lastRunMetrics = metrics;
 
-    if (!wasChunked) {
-      final summary = await _generateSummary(chunks.first);
+    if (chunks.length == 1) {
+      final summary = await _generateSummary(
+        chunks.first,
+        metrics: metrics,
+      );
+      metrics.recordDone(
+        tokens: metrics.tokenCount,
+        summaryLength: summary.length,
+        qualityPassed: !SummaryQualityGate.isBadSummary(summary, chunks.first),
+      );
+      SummarizationMetricsStore.instance.add(metrics);
       return SummarizationResult(
         summary: summary,
-        wasChunked: false,
         wasTruncated: prepared.wasTruncated,
+        metrics: metrics,
       );
     }
 
     final partialSummaries = <String>[];
-    for (var i = 0; i < chunks.length; i++) {
-      AppLogger.log('SUMMARIZE', 'Summarizing chunk ${i + 1}/${chunks.length}');
-      final partial = await _generateSummary(chunks[i]);
+    for (final chunk in chunks) {
+      final partial = await _generateSummary(chunk, metrics: metrics);
       if (partial.isNotEmpty) {
         partialSummaries.add(partial);
       }
     }
-
     if (partialSummaries.isEmpty) {
       throw const SummarizationServiceException(
         'Failed to summarize any transcript chunks.',
       );
     }
-
     if (partialSummaries.length == 1) {
+      metrics.recordDone(
+        tokens: metrics.tokenCount,
+        summaryLength: partialSummaries.first.length,
+        qualityPassed: true,
+      );
+      SummarizationMetricsStore.instance.add(metrics);
       return SummarizationResult(
         summary: partialSummaries.first,
         wasChunked: true,
         wasTruncated: prepared.wasTruncated,
+        metrics: metrics,
       );
     }
 
-    final combined = partialSummaries
-        .asMap()
-        .entries
-        .map((e) => 'Part ${e.key + 1}: ${e.value}')
-        .join('\n\n');
-
+    final combined = _chunking.formatCombineInput(partialSummaries);
     final finalSummary = await _generateSummary(
       combined,
       systemPrompt: AppModelPreset.combineSystemPrompt,
       isCombinePass: true,
+      metrics: metrics,
+      maxTokens: _profile.combineMaxOutputTokens,
     );
-
+    metrics.recordDone(
+      tokens: metrics.tokenCount,
+      summaryLength: finalSummary.length,
+      qualityPassed: !SummaryQualityGate.isBadSummary(finalSummary, combined),
+    );
+    SummarizationMetricsStore.instance.add(metrics);
     return SummarizationResult(
       summary: finalSummary,
       wasChunked: true,
       wasTruncated: prepared.wasTruncated,
+      metrics: metrics,
     );
   }
 
-  String prepareInput(String transcript) {
-    return _prepareTranscript(transcript).text;
-  }
+  String prepareInput(String transcript) => _prepareTranscript(transcript).text;
 
+  /// True token streaming: yields tokens as native generates them.
   Stream<String> summarize(String transcript) async* {
-    final cleaned = prepareInput(transcript);
+    final prepared = _prepareTranscript(transcript);
+    final cleaned = prepared.text;
     if (cleaned.isEmpty) {
       throw const SummarizationServiceException(
         'Transcript is empty. Record and transcribe first.',
       );
     }
-
     await ensureModelLoaded();
+    final chunks = _chunking.chunk(cleaned);
+    final metrics = SummarizationRunMetrics(
+      presetId: _activePreset.id,
+      transcriptChars: cleaned.length,
+      chunkCount: chunks.length,
+      wasTruncated: prepared.wasTruncated,
+    );
+    _lastRunMetrics = metrics;
 
-    final chunks = _chunkTranscript(cleaned);
     AppLogger.log(
       'SUMMARIZE',
-      'Streaming summary. preset=${_activePreset.id} transcriptChars=${cleaned.length} '
-      'chunks=${chunks.length} nCtx=$_effectiveNCtx',
+      'Streaming preset=${_activePreset.id} chars=${cleaned.length} chunks=${chunks.length}',
     );
 
     if (chunks.length == 1) {
-      final summary = await _generateSummary(chunks.first);
-      if (summary.isNotEmpty) {
-        yield summary;
+      final userPrompt = _userPromptForSlice(chunks.first);
+      final buffer = StringBuffer();
+      await for (final token in _streamSummary(userPrompt)) {
+        metrics.tokenCount += 1;
+        metrics.recordFirstToken(
+          DateTime.now().difference(metrics.startedAt).inMilliseconds,
+        );
+        buffer.write(token);
+        yield token;
       }
+      var summary = SummaryQualityGate.clean(buffer.toString());
+      if (SummaryQualityGate.isBadSummary(summary, chunks.first)) {
+        metrics.retryCount += 1;
+        buffer.clear();
+        await for (final token in _streamSummary(
+          chunks.first,
+          systemPrompt:
+              'Reply with only the summary sentences. Do not repeat any instructions.',
+        )) {
+          buffer.write(token);
+          yield token;
+        }
+        summary = SummaryQualityGate.clean(buffer.toString());
+      }
+      metrics.recordDone(
+        tokens: metrics.tokenCount,
+        summaryLength: summary.length,
+        qualityPassed: !SummaryQualityGate.isBadSummary(summary, chunks.first),
+      );
+      SummarizationMetricsStore.instance.add(metrics);
       return;
     }
 
     final partialSummaries = <String>[];
     for (var i = 0; i < chunks.length; i++) {
-      final partial = await _generateSummary(chunks[i]);
+      AppLogger.log('SUMMARIZE', 'Map chunk ${i + 1}/${chunks.length}');
+      final partial = await _generateSummary(chunks[i], metrics: metrics);
       if (partial.isNotEmpty) {
         partialSummaries.add(partial);
       }
     }
-
     if (partialSummaries.isEmpty) {
       throw const SummarizationServiceException(
         'Failed to summarize any transcript chunks.',
       );
     }
-
     if (partialSummaries.length == 1) {
       yield partialSummaries.first;
+      metrics.recordDone(
+        tokens: metrics.tokenCount,
+        summaryLength: partialSummaries.first.length,
+        qualityPassed: true,
+      );
+      SummarizationMetricsStore.instance.add(metrics);
       return;
     }
 
-    final combined = partialSummaries
-        .asMap()
-        .entries
-        .map((e) => 'Part ${e.key + 1}: ${e.value}')
-        .join('\n\n');
-
-    final finalSummary = await _generateSummary(
-      combined,
+    final combined = _chunking.formatCombineInput(partialSummaries);
+    final combineBuffer = StringBuffer();
+    await for (final token in _streamSummary(
+      _userPromptForCombine(combined),
       systemPrompt: AppModelPreset.combineSystemPrompt,
-      isCombinePass: true,
-    );
-    if (finalSummary.isNotEmpty) {
-      yield finalSummary;
+      maxTokens: _profile.combineMaxOutputTokens,
+    )) {
+      metrics.recordFirstToken(
+        DateTime.now().difference(metrics.startedAt).inMilliseconds,
+      );
+      combineBuffer.write(token);
+      yield token;
     }
+    final finalSummary = SummaryQualityGate.clean(combineBuffer.toString());
+    metrics.recordDone(
+      tokens: metrics.tokenCount,
+      summaryLength: finalSummary.length,
+      qualityPassed: !SummaryQualityGate.isBadSummary(finalSummary, combined),
+    );
+    SummarizationMetricsStore.instance.add(metrics);
   }
 
   Future<void> dispose() async {
-    AppLogger.log('MODEL', 'Disposing summarization service...');
     final worker = _worker;
     if (worker != null) {
       await worker.close();
@@ -537,10 +487,8 @@ Summary:''';
 
   Future<void> updateModelPath(String? newPath) async {
     if (_modelPath == newPath) {
-      AppLogger.log('MODEL', 'Model path unchanged, skipping update.');
       return;
     }
-    AppLogger.log('MODEL', 'Updating model path from $_modelPath to $newPath');
     await dispose();
     _modelPath = newPath;
   }

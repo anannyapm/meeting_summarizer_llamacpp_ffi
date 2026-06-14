@@ -176,9 +176,10 @@ typedef _BridgeSessionStreamChatDart =
     );
 
 typedef _BridgeSessionLoadModelNative =
-    Int32 Function(Pointer<BridgeSessionPointer>, Pointer<Utf8>, Int32, Int32);
+    Int32 Function(Pointer<BridgeSessionPointer>, Pointer<Utf8>, Int32, Int32,
+        Int32, Int32);
 typedef _BridgeSessionLoadModelDart =
-    int Function(Pointer<BridgeSessionPointer>, Pointer<Utf8>, int, int);
+    int Function(Pointer<BridgeSessionPointer>, Pointer<Utf8>, int, int, int, int);
 
 typedef _BridgeSessionUnloadModelNative =
     Int32 Function(Pointer<BridgeSessionPointer>);
@@ -537,6 +538,8 @@ class NativeBridgeSession {
     required String modelPath,
     required int nCtx,
     required int nGpuLayers,
+    int nBatch = 64,
+    int nThreads = 4,
   }) {
     _ensureActive();
     final pathPtr = modelPath.toNativeUtf8();
@@ -546,6 +549,8 @@ class NativeBridgeSession {
         pathPtr,
         nCtx,
         nGpuLayers,
+        nBatch,
+        nThreads,
       );
       if (status != 0) {
         _bridgeThrow(status, operation: 'bridge_session_load_model');

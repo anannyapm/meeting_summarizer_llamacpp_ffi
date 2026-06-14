@@ -73,7 +73,8 @@ int bridge_session_stream_chat(BridgeSession *session,
                                BridgeTokenCallback on_token, void *user_data);
 
 int bridge_session_load_model(BridgeSession *session, const char *model_path,
-                              int n_ctx, int n_gpu_layers);
+                              int n_ctx, int n_gpu_layers, int n_batch,
+                              int n_threads);
 
 int bridge_session_unload_model(BridgeSession *session);
 

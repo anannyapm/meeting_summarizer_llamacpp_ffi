@@ -199,12 +199,17 @@ class ModelManager {
     if (await file.exists()) {
       if (expectedSha != null && expectedSha.isNotEmpty) {
         final ok = await verifyChecksum(file, expectedSha);
-        if (ok &&
-            _bytesMatchExpected(
-              await file.length(),
-              expectedBytes,
-              expectedSha,
-            )) {
+        if (!ok) {
+          await file.delete();
+          throw ModelManagerException(
+            'Downloaded model failed SHA-256 verification. Please retry download.',
+          );
+        }
+        if (_bytesMatchExpected(
+          await file.length(),
+          expectedBytes,
+          expectedSha,
+        )) {
           return file;
         }
         await file.delete();
@@ -262,6 +267,28 @@ class ModelManager {
     } catch (e) {
       throw ModelManagerException('Failed to extract bundled model: $e');
     }
+  }
+
+  Future<List<File>> listDownloadedModels() async {
+    final dir = await _modelDirectory();
+    if (!await dir.exists()) {
+      return <File>[];
+    }
+    final entries = await dir.list().toList();
+    return entries
+        .whereType<File>()
+        .where((f) => !f.path.endsWith('.tmp'))
+        .toList()
+      ..sort((a, b) => b.statSync().modified.compareTo(a.statSync().modified));
+  }
+
+  Future<int> totalDownloadedBytes() async {
+    final files = await listDownloadedModels();
+    var total = 0;
+    for (final file in files) {
+      total += await file.length();
+    }
+    return total;
   }
 
   Future<void> deleteOldModels({

@@ -397,6 +397,75 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const Text(
+                    'Model Storage',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Consumer<SummarizationProvider>(
+                    builder: (context, summarization, _) {
+                      return FutureBuilder<int>(
+                        future: ModelManager(
+                          modelName: AppModelPresets.resolveById(
+                            context.read<SettingsProvider>().selectedModelPresetId,
+                          ).fileName,
+                        ).totalDownloadedBytes(),
+                        builder: (context, snapshot) {
+                          final label = snapshot.hasData
+                              ? _formatBytes(snapshot.data!)
+                              : 'Calculating...';
+                          return Text(
+                            'Downloaded models on disk: $label',
+                            style: const TextStyle(
+                              fontSize: 12,
+                              color: Colors.white70,
+                            ),
+                          );
+                        },
+                      );
+                    },
+                  ),
+                  const SizedBox(height: 12),
+                  Consumer2<SettingsProvider, SummarizationProvider>(
+                    builder: (context, settings, summarization, _) {
+                      final activePreset =
+                          AppModelPresets.resolveById(settings.selectedModelPresetId);
+                      return OutlinedButton(
+                        onPressed: () async {
+                          final manager = ModelManager(modelName: activePreset.fileName);
+                          await manager.deleteOldModels(
+                            keepLatest: 3,
+                            keepFileName: activePreset.fileName,
+                          );
+                          if (!context.mounted) {
+                            return;
+                          }
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                              content: Text(
+                                'Removed older model files (kept active preset).',
+                              ),
+                            ),
+                          );
+                        },
+                        child: const Text('Free Disk Space (keep active model)'),
+                      );
+                    },
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
                     'About',
                     style: TextStyle(
                       fontSize: 16,

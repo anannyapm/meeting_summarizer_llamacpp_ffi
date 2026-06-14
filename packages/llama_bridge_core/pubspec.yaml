@@ -1,0 +1,7 @@
+name: llama_bridge_core
+description: Dart API types for local llama.cpp inference (model/session/generation).
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.11.3

@@ -1,0 +1,13 @@
+name: llama_bridge_flutter
+description: Flutter implementation of llama_bridge_core using Dart FFI worker isolate.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.11.3
+
+dependencies:
+  flutter:
+    sdk: flutter
+  llama_bridge_core:
+    path: ../llama_bridge_core

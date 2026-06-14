@@ -20,6 +20,9 @@ class AppModelPreset {
     this.mobileMaxOutputTokens = 64,
     this.mobileMaxTranscriptChars = 500,
     this.mobileGpuLayers = 0,
+    this.mobileNBatch = 64,
+    this.mobileNThreads = 4,
+    this.mobileCombineMaxOutputTokens = 96,
     this.promptMode = ModelPromptMode.nativeChatTemplate,
   });
 
@@ -37,17 +40,20 @@ class AppModelPreset {
   final int mobileMaxOutputTokens;
   final int mobileMaxTranscriptChars;
   final int mobileGpuLayers;
+  final int mobileNBatch;
+  final int mobileNThreads;
+  final int mobileCombineMaxOutputTokens;
   final ModelPromptMode promptMode;
 
   static const String systemPrompt =
       'You are a meeting summarizer. The user message is a raw transcript. '
-      'Reply with a short summary in 2 to 4 sentences: main topics, decisions, '
-      'and action items. Never repeat instructions or transcript text.';
+      'Reply with a short summary in 2 to 4 sentences covering main topics, '
+      'decisions, and action items. Never repeat instructions or transcript text.';
 
   static const String combineSystemPrompt =
-      'You merge partial meeting summaries into one coherent summary. '
-      'Write 2 to 5 complete sentences. Do not list parts or repeat source text. '
-      'Output only the final summary.';
+      'You merge partial meeting summaries into one coherent paragraph. '
+      'Write 2 to 5 complete sentences in plain prose. '
+      'Do not use bullet lists or labels like Part 1. Output only the final summary.';
 }
 
 class AppModelPresets {
@@ -65,6 +71,9 @@ class AppModelPresets {
       mobileNCtx: 512,
       mobileMaxOutputTokens: 80,
       mobileMaxTranscriptChars: 600,
+      mobileNBatch: 64,
+      mobileNThreads: 4,
+      mobileCombineMaxOutputTokens: 96,
       promptMode: ModelPromptMode.plainEcho,
     ),
     AppModelPreset(
@@ -78,6 +87,9 @@ class AppModelPresets {
       mobileNCtx: 512,
       mobileMaxOutputTokens: 80,
       mobileMaxTranscriptChars: 600,
+      mobileNBatch: 64,
+      mobileNThreads: 4,
+      mobileCombineMaxOutputTokens: 96,
     ),
     AppModelPreset(
       id: 'llama3_2_1b_q4_k_m',

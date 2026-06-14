@@ -642,7 +642,8 @@ int bridge_session_stream_chat(BridgeSession *session,
 }
 
 int bridge_session_load_model(BridgeSession *session, const char *model_path,
-                              int n_ctx, int n_gpu_layers) {
+                              int n_ctx, int n_gpu_layers, int n_batch,
+                              int n_threads) {
   if (session == nullptr || model_path == nullptr) {
     return BRIDGE_STATUS_NULL_ARG;
   }
@@ -691,12 +692,15 @@ int bridge_session_load_model(BridgeSession *session, const char *model_path,
     "[llama_bridge] context configured n_ctx=%u\n",
     ctx_params.n_ctx);
   }
-  const int thread_count = default_thread_count();
-  LOGI("[llama_bridge] using n_threads=%d", thread_count);
+  const int thread_count =
+      n_threads > 0 ? n_threads : default_thread_count();
+  const int batch_size = n_batch > 0 ? n_batch : 64;
+  LOGI("[llama_bridge] using n_threads=%d n_batch=%d", thread_count,
+       batch_size);
   ctx_params.n_threads = thread_count;
   ctx_params.n_threads_batch = thread_count;
-  ctx_params.n_batch = 64;
-  ctx_params.n_ubatch = 64;
+  ctx_params.n_batch = batch_size;
+  ctx_params.n_ubatch = batch_size;
   // Register an abort callback so bridge_session_abort_stream() can stop an
   // ongoing llama_decode call from another thread.
   ctx_params.abort_callback = [](void *data) -> bool {
