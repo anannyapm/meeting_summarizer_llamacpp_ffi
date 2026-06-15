@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:ffi_learn/core/app_logger.dart';
+import 'package:ffi_learn/services/whisper_transcript_sanitizer.dart';
 import 'package:path/path.dart' as p;
 import 'package:whisper_ggml/whisper_ggml.dart';
 
@@ -57,11 +58,23 @@ class FileTranscriptionService {
       throw const FileTranscriptionException('Whisper transcription returned no result.');
     }
 
-    final text = result.transcription.text.trim();
+    final rawText = result.transcription.text.trim();
+    final text = WhisperTranscriptSanitizer.clean(rawText);
     AppLogger.log(
       'STT',
-      'Whisper transcription done in ${result.time.inMilliseconds} ms chars=${text.length}',
+      'Whisper transcription done in ${result.time.inMilliseconds} ms '
+      'rawChars=${rawText.length} cleanChars=${text.length}',
     );
+
+    if (text.isEmpty) {
+      throw const FileTranscriptionException(
+        'No speech detected in the recording. '
+        'Speak closer to the mic, record for a few seconds, or on an emulator '
+        'enable mic input (Extended controls → Microphone). '
+        'You can also paste a transcript manually.',
+      );
+    }
+
     return text;
   }
 }

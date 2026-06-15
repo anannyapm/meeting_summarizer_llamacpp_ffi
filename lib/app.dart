@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import 'package:ffi_learn/core/app_theme.dart';
+
 import 'package:ffi_learn/providers/summarization_provider.dart';
 import 'package:ffi_learn/screens/game_splash_screen.dart';
 import 'package:ffi_learn/screens/meeting_summarizer_screen.dart';
@@ -50,7 +52,7 @@ class _AppShellState extends State<AppShell> {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'Offline Meeting Summarizer',
-      theme: ThemeData.dark(useMaterial3: true),
+      theme: AppTheme.dark(),
       home: Consumer<SummarizationProvider>(
         builder: (context, summarization, _) {
           final modelAlreadyWarm = summarization.isModelLoaded;
